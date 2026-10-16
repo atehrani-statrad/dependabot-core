@@ -4,6 +4,7 @@
 require "dependabot/dependency_file"
 require "dependabot/npm_and_yarn/file_parser"
 require "dependabot/npm_and_yarn/helpers"
+require "dependabot/package/npm_lockfile_details"
 require "sorbet-runtime"
 
 module Dependabot
@@ -16,7 +17,8 @@ module Dependabot
         require "dependabot/npm_and_yarn/file_parser/pnpm_lock"
         require "dependabot/npm_and_yarn/file_parser/json_lock"
 
-        DEFAULT_LOCKFILES = %w(package-lock.json yarn.lock pnpm-lock.yaml npm-shrinkwrap.json).freeze
+        # npm gives npm-shrinkwrap.json precedence over package-lock.json when both exist
+        DEFAULT_LOCKFILES = %w(npm-shrinkwrap.json package-lock.json yarn.lock pnpm-lock.yaml).freeze
 
         LockFile = T.type_alias { T.any(JsonLock, YarnLock, PnpmLock) }
 
@@ -48,10 +50,10 @@ module Dependabot
 
         sig do
           params(dependency_name: String, requirement: T.nilable(String), manifest_name: String)
-            .returns(T.nilable(T::Hash[String, T.untyped]))
+            .returns(T.nilable(Dependabot::Package::NpmLockfileDetails))
         end
         def lockfile_details(dependency_name:, requirement:, manifest_name:)
-          details = T.let(nil, T.nilable(T::Hash[String, T.untyped]))
+          details = T.let(nil, T.nilable(Dependabot::Package::NpmLockfileDetails))
           potential_lockfiles_for_manifest(manifest_name).each do |lockfile|
             details = lockfile_for(lockfile).details(dependency_name, requirement, manifest_name)
 
@@ -75,6 +77,7 @@ module Dependabot
 
           possible_lockfile_names.uniq
                                  .filter_map { |nm| dependency_files.find { |f| f.name == nm } }
+                                 .reject { |f| shadowed_package_lock?(f) }
         end
 
         sig { params(file: DependencyFile).returns(LockFile) }
@@ -99,7 +102,19 @@ module Dependabot
 
         sig { returns(T::Array[DependencyFile]) }
         def package_locks
-          @package_locks ||= T.let(select_files_by_extension("package-lock.json"), T.nilable(T::Array[DependencyFile]))
+          @package_locks ||= T.let(
+            select_files_by_extension("package-lock.json").reject { |file| shadowed_package_lock?(file) },
+            T.nilable(T::Array[DependencyFile])
+          )
+        end
+
+        # npm ignores a package-lock.json when an npm-shrinkwrap.json sits in the same directory
+        sig { params(file: DependencyFile).returns(T::Boolean) }
+        def shadowed_package_lock?(file)
+          return false unless file.name.end_with?("package-lock.json")
+
+          shrinkwrap_name = Pathname.new(File.join(File.dirname(file.name), "npm-shrinkwrap.json")).cleanpath.to_path
+          dependency_files.any? { |f| f.name == shrinkwrap_name }
         end
 
         sig { returns(T::Array[DependencyFile]) }

@@ -59,6 +59,7 @@ unless Etc.getpwuid(Process.uid).name == "dependabot" || ENV["ALLOW_DRY_RUN_STAN
   exit 1
 end
 
+$LOAD_PATH << "./apm/lib"
 $LOAD_PATH << "./bazel/lib"
 $LOAD_PATH << "./bun/lib"
 $LOAD_PATH << "./bundler/lib"
@@ -119,6 +120,7 @@ require "dependabot/pull_request_creator"
 require "dependabot/config/file_fetcher"
 require "dependabot/simple_instrumentor"
 
+require "dependabot/apm"
 require "dependabot/bazel"
 require "dependabot/bun"
 require "dependabot/bundler"
@@ -236,7 +238,7 @@ if ENV.key?("COOLDOWN") && !ENV["COOLDOWN"].to_s.strip.empty?
   $options[:cooldown] = JSON.parse(ENV.fetch("COOLDOWN", "{}"))
 end
 
-# rubocop:disable Metrics/BlockLength
+# rubocop:disable-next Metrics/BlockLength
 option_parse = OptionParser.new do |opts|
   opts.banner = "usage: ruby bin/dry-run.rb [OPTIONS] PACKAGE_MANAGER REPO"
 
@@ -358,7 +360,6 @@ option_parse = OptionParser.new do |opts|
     $options[:api_endpoint] = File.join(value, "api", "v3")
   end
 end
-# rubocop:enable Metrics/BlockLength
 
 # Parse options before validating arguments
 option_parse.parse!
@@ -371,6 +372,7 @@ end
 
 # Validate package manager
 valid_package_managers = %w(
+  apm
   bazel
   bun
   bundler
@@ -420,6 +422,20 @@ $package_manager, $repo_name = ARGV
 # Ensure the script does not exit prematurely
 begin
   $package_manager, $repo_name = ARGV
+
+  # Known errors are printed as "handled" and skipped; collect them so the run doesn't report success.
+  $handled_errors = []
+
+  def finish_dry_run
+    if $handled_errors.empty?
+      puts "Dry-run completed successfully."
+      exit 0
+    end
+
+    puts "Dry-run completed with #{$handled_errors.size} handled error(s):"
+    $handled_errors.each { |error| puts "  - #{error}" }
+    exit 1
+  end
 
   def show_diff(original_file, updated_file)
     return unless original_file
@@ -476,7 +492,7 @@ begin
   # rubocop:disable Metrics/AbcSize
   # rubocop:disable Metrics/MethodLength
   # rubocop:disable Metrics/CyclomaticComplexity
-  # rubocop:disable Metrics/PerceivedComplexity
+  # rubocop:disable-next Metrics/PerceivedComplexity
   def cached_dependency_files_read
     cache_dir = dependency_files_cache_dir
     cache_manifest_path = File.join(
@@ -539,7 +555,6 @@ begin
       data
     end
   end
-  # rubocop:enable Metrics/PerceivedComplexity
   # rubocop:enable Metrics/CyclomaticComplexity
   # rubocop:enable Metrics/MethodLength
   # rubocop:enable Metrics/AbcSize
@@ -572,8 +587,9 @@ begin
     error_details = Dependabot.fetcher_error_details(e)
     raise unless error_details
 
-    puts " => handled error whilst fetching dependencies: #{error_details.fetch(:"error-type")} " \
-         "#{error_details.fetch(:"error-detail")}"
+    puts " => handled error whilst fetching dependencies: #{error_details.error_type} " \
+         "#{error_details.error_detail}"
+    $handled_errors << "fetching dependencies: #{error_details.error_type}"
 
     []
   end
@@ -584,8 +600,9 @@ begin
     error_details = Dependabot.parser_error_details(e)
     raise unless error_details
 
-    puts " => handled error whilst parsing dependencies: #{error_details.fetch(:"error-type")} " \
-         "#{error_details.fetch(:"error-detail")}"
+    puts " => handled error whilst parsing dependencies: #{error_details.error_type} " \
+         "#{error_details.error_detail}"
+    $handled_errors << "parsing dependencies: #{error_details.error_type}"
 
     []
   end
@@ -662,7 +679,7 @@ begin
 
   fetcher = Dependabot::FileFetchers.for_package_manager($package_manager).new(**fetcher_args)
   $files = fetch_files(fetcher)
-  return if $files.empty?
+  finish_dry_run if $files.empty?
 
   ecosystem_versions = fetcher.ecosystem_versions
   puts "🎈 Ecosystem Versions log: #{ecosystem_versions}" unless ecosystem_versions.nil?
@@ -779,7 +796,7 @@ begin
       dependency_files: $files,
       repo_contents_path: $repo_contents_path,
       credentials: $options[:credentials],
-      options: $options[:updater_options]
+      options: $options[:updater_options].merge(source_hostname: $source.hostname)
     )
   end
 
@@ -950,8 +967,9 @@ begin
     error_details = Dependabot.updater_error_details(e)
     raise unless error_details
 
-    puts " => handled error whilst updating #{dep.name}: #{error_details.fetch(:"error-type")} " \
-         "#{error_details.fetch(:"error-detail")}"
+    puts " => handled error whilst updating #{dep.name}: #{error_details.error_type} " \
+         "#{error_details.error_detail}"
+    $handled_errors << "updating #{dep.name}: #{error_details.error_type}"
   end
 
   StackProf.stop if $options[:profile]
@@ -967,6 +985,4 @@ rescue StandardError => e
   exit 1
 end
 
-# Ensure the script exits successfully if no errors occur
-puts "Dry-run completed successfully."
-exit 0
+finish_dry_run

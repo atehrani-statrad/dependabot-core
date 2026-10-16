@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "spec_helper"
@@ -326,6 +326,8 @@ RSpec.describe Dependabot::Docker::FileFetcher do
           "values-other.yaml",
           "values_other.yml",
           "values_other.yaml",
+          "values.other.yml",
+          "values.other.yaml",
           "values2.yml",
           "values2.yaml"
         ]

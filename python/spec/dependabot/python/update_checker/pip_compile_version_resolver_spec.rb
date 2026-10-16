@@ -1,4 +1,4 @@
-# typed: false
+# typed: true
 # frozen_string_literal: true
 
 require "spec_helper"
@@ -6,8 +6,7 @@ require "dependabot/dependency"
 require "dependabot/dependency_file"
 require "dependabot/python/update_checker/pip_compile_version_resolver"
 
-namespace = Dependabot::Python::UpdateChecker
-RSpec.describe namespace::PipCompileVersionResolver do
+RSpec.describe Dependabot::Python::UpdateChecker::PipCompileVersionResolver do
   let(:resolver) do
     described_class.new(
       dependency: dependency,
@@ -59,6 +58,12 @@ RSpec.describe namespace::PipCompileVersionResolver do
       groups: [],
       source: nil
     }]
+  end
+
+  describe "#resolvable?" do
+    it "returns false when the version is nil" do
+      expect(resolver.resolvable?(version: nil)).to be(false)
+    end
   end
 
   describe "#latest_resolvable_version" do

@@ -2,6 +2,7 @@
 
 source "https://rubygems.org"
 
+gem "dependabot-apm", path: "apm"
 gem "dependabot-bazel", path: "bazel"
 gem "dependabot-bun", path: "bun"
 gem "dependabot-bundler", path: "bundler"
@@ -39,9 +40,9 @@ gem "dependabot-vcpkg", path: "vcpkg"
 
 # Sorbet
 gem "sorbet", "~> 0.6", group: :development
-gem "tapioca", "~> 0.17", require: false, group: :development
+gem "tapioca", "~> 0.19", require: false, group: :development
 
-gem "zeitwerk", "~> 2.7"
+gem "zeitwerk", "~> 2.8"
 
 common_gemspec = File.expand_path("common/dependabot-common.gemspec", __dir__)
 
@@ -58,7 +59,7 @@ deps_shared_with_common = %w(
   simplecov
   stackprof
   strscan
-  turbo_tests
+  turbo_tests2
   vcr
   webmock
   webrick

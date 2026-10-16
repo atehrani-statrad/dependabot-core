@@ -1,13 +1,14 @@
 # typed: strict
 # frozen_string_literal: true
 
-require "json"
 require "sorbet-runtime"
 
 require "dependabot/dependency"
 require "dependabot/file_parsers"
 require "dependabot/file_parsers/base"
 require "dependabot/shared_helpers"
+require "dependabot/nix/channel"
+require "dependabot/nix/lockfile"
 require "dependabot/nix/package_manager"
 
 module Dependabot
@@ -15,8 +16,8 @@ module Dependabot
     class FileParser < Dependabot::FileParsers::Base
       extend T::Sig
 
-      # Source types that are backed by git and can be updated via revision tracking
-      SUPPORTED_SOURCE_TYPES = T.let(%w(github gitlab sourcehut git).freeze, T::Array[String])
+      # Updatable source types: git-backed sources plus NixOS channel tarballs.
+      SUPPORTED_SOURCE_TYPES = %w(github gitlab sourcehut git tarball).freeze
 
       SUPPORTED_LOCK_VERSION = 7
 
@@ -31,22 +32,17 @@ module Dependabot
 
       sig { override.returns(T::Array[Dependabot::Dependency]) }
       def parse
-        lock_content = JSON.parse(T.must(flake_lock.content))
+        lockfile = Lockfile.new(T.must(flake_lock.content))
 
-        lock_version = lock_content["version"]
+        lock_version = lockfile.version
         if lock_version != SUPPORTED_LOCK_VERSION
           Dependabot.logger.warn(
             "flake.lock version #{lock_version.inspect} differs from expected #{SUPPORTED_LOCK_VERSION}"
           )
         end
 
-        root_name = lock_content.fetch("root", "root")
-        nodes = lock_content.fetch("nodes", {})
-        root_node = nodes.fetch(root_name, {})
-        root_inputs = root_node.fetch("inputs", {})
-
-        root_inputs.filter_map do |input_name, node_label|
-          node = resolve_node(node_label, nodes)
+        lockfile.root_input_names.filter_map do |input_name|
+          node = lockfile.input_node(input_name)
           next unless node
 
           build_dependency(input_name, node)
@@ -66,60 +62,6 @@ module Dependabot
 
       private
 
-      # Resolves a node_label to its node in the lock file.
-      # node_label is either a string (direct reference) or an array ("follows" path
-      # that must be walked through nested inputs maps).
-      sig do
-        params(
-          node_label: T.any(String, T::Array[String]),
-          nodes: T::Hash[String, T.untyped]
-        ).returns(T.nilable(T::Hash[String, T.untyped]))
-      end
-      def resolve_node(node_label, nodes)
-        return nodes[node_label] unless node_label.is_a?(Array)
-        return nil if node_label.empty?
-
-        # Walk the "follows" path: e.g. ["nixpkgs", "flake-utils"] means
-        # follow root -> nixpkgs node -> its inputs -> flake-utils
-        resolved_label = resolve_follows_path(node_label, nodes)
-        resolved_label ? nodes[resolved_label] : nil
-      end
-
-      # Walks a "follows" path through nested inputs to find the final node label.
-      sig do
-        params(
-          path: T::Array[String],
-          nodes: T::Hash[String, T.untyped]
-        ).returns(T.nilable(String))
-      end
-      def resolve_follows_path(path, nodes)
-        current_node_label = T.let(nil, T.nilable(String))
-
-        path.each_with_index do |segment, index|
-          # For the first segment, look up in the root's inputs via nodes directly
-          target = if index.zero?
-                     # The first segment references a top-level node by name
-                     segment
-                   else
-                     # Subsequent segments look up inputs within the current node
-                     node = nodes[T.must(current_node_label)]
-                     return nil unless node.is_a?(Hash)
-
-                     inputs = node.fetch("inputs", nil)
-                     return nil unless inputs.is_a?(Hash)
-
-                     label = inputs[segment]
-                     return nil unless label.is_a?(String)
-
-                     label
-                   end
-
-          current_node_label = target
-        end
-
-        current_node_label
-      end
-
       sig do
         params(
           input_name: String,
@@ -134,9 +76,28 @@ module Dependabot
         source_type = locked.fetch("type", nil)
         return unless SUPPORTED_SOURCE_TYPES.include?(source_type)
 
+        # Skip inputs pinned to a bare commit SHA: no branch or tag to track.
+        return if revision_pinned?(original)
+
         rev = locked.fetch("rev", nil)
         return unless rev
 
+        if source_type == "tarball"
+          build_tarball_dependency(input_name, original, rev)
+        else
+          build_git_dependency(input_name, locked, original, rev)
+        end
+      end
+
+      sig do
+        params(
+          input_name: String,
+          locked: T::Hash[String, T.untyped],
+          original: T::Hash[String, T.untyped],
+          rev: String
+        ).returns(T.nilable(Dependabot::Dependency))
+      end
+      def build_git_dependency(input_name, locked, original, rev)
         url = build_url(locked)
         return unless url
 
@@ -155,6 +116,38 @@ module Dependabot
         )
       end
 
+      sig { params(original: T::Hash[String, T.untyped]).returns(T::Boolean) }
+      def revision_pinned?(original)
+        !original.fetch("rev", nil).nil?
+      end
+
+      # Channel tarballs track a channel in the URL (e.g. nixos-26.05), not a git
+      # ref. Non-channel tarballs aren't updatable, so they're skipped.
+      sig do
+        params(
+          input_name: String,
+          original: T::Hash[String, T.untyped],
+          rev: String
+        ).returns(T.nilable(Dependabot::Dependency))
+      end
+      def build_tarball_dependency(input_name, original, rev)
+        url = original.fetch("url", nil)
+        channel = Channel.channel_name_from_url(url)
+        return unless channel
+
+        Dependency.new(
+          name: input_name,
+          version: rev,
+          package_manager: "nix",
+          requirements: [{
+            requirement: nil,
+            file: "flake.lock",
+            source: { type: "tarball", url: url, branch: nil, ref: channel },
+            groups: []
+          }]
+        )
+      end
+
       sig { params(locked: T::Hash[String, T.untyped]).returns(T.nilable(String)) }
       def build_url(locked)
         case locked["type"]
@@ -166,7 +159,7 @@ module Dependabot
           "https://#{host}/#{locked['owner']}/#{locked['repo']}"
         when "sourcehut"
           host = locked["host"] || DEFAULT_HOSTS["sourcehut"]
-          "https://#{host}/~#{locked['owner']}/#{locked['repo']}"
+          "https://#{host}/#{locked['owner']}/#{locked['repo']}"
         when "git"
           locked["url"]
         end

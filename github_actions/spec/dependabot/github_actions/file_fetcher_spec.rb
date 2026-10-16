@@ -88,6 +88,179 @@ RSpec.describe Dependabot::GithubActions::FileFetcher do
         expect(file_fetcher_instance.files.map(&:name))
           .to match_array(%w(sherlock-workflow.yaml integration-workflow.yml))
       end
+
+      context "when an actions.lock is present" do
+        before do
+          Dependabot::Experiments.register(:github_actions_lockfile, true)
+          stub_request(:get, url + ".github/workflows?ref=sha")
+            .with(headers: { "Authorization" => "token token" })
+            .to_return(
+              status: 200,
+              body: fixture("github", "contents_githubaction_repo_workflows_with_lock.json"),
+              headers: { "content-type" => "application/json" }
+            )
+          stub_request(:get, url + ".github/workflows/actions.lock?ref=sha")
+            .with(headers: { "Authorization" => "token token" })
+            .to_return(
+              status: 200,
+              body: fixture("github", "contents_githubaction_lockfile.json"),
+              headers: { "content-type" => "application/json" }
+            )
+        end
+
+        it "fetches the lockfile relative to the configured directory" do
+          lockfile = file_fetcher_instance.files.find { |file| file.name == "actions.lock" }
+
+          expect(lockfile&.path).to eq("/.github/workflows/actions.lock")
+        end
+      end
+    end
+
+    context "when an actions.lock is present" do
+      before do
+        Dependabot::Experiments.register(:github_actions_lockfile, true)
+        # Re-stub the workflows listing to include the lockfile alongside the
+        # workflow files, then stub the lockfile content fetch.
+        stub_request(:get, url + ".github/workflows?ref=sha")
+          .with(headers: { "Authorization" => "token token" })
+          .to_return(
+            status: 200,
+            body: fixture("github", "contents_githubaction_repo_workflows_with_lock.json"),
+            headers: { "content-type" => "application/json" }
+          )
+        stub_request(
+          :get,
+          File.join(url, ".github/workflows/actions.lock?ref=sha")
+        ).with(headers: { "Authorization" => "token token" })
+          .to_return(
+            status: 200,
+            body: fixture("github", "contents_githubaction_lockfile.json"),
+            headers: { "content-type" => "application/json" }
+          )
+      end
+
+      it "additively fetches the lockfile alongside the workflow files" do
+        expect(file_fetcher_instance.files.map(&:name))
+          .to match_array(
+            %w(.github/workflows/sherlock-workflow.yaml
+               .github/workflows/integration-workflow.yml
+               .github/workflows/actions.lock)
+          )
+      end
+
+      context "when a workflow uses a self repository action" do
+        let(:workflow_file_fixture) do
+          contents_json(".github/workflows/ci.yml", "jobs:\n  a:\n    steps:\n      - uses: $/tools/setup\n")
+        end
+
+        def contents_json(path, content)
+          { type: "file", name: File.basename(path), path: path, encoding: "base64",
+            content: Base64.encode64(content) }.to_json
+        end
+
+        before do
+          stub_request(:get, github_url + "repos/gocardless/bump/git/trees/sha?recursive=true")
+            .to_return(
+              status: 200,
+              headers: { "content-type" => "application/json" },
+              body: { truncated: false, tree: [
+                { path: "tools/setup/action.yml", type: "blob" },
+                { path: ".github/actions/inner/action.yaml", type: "blob" },
+                { path: "tools/setup/README.md", type: "blob" }
+              ] }.to_json
+            )
+          %w(tools/setup/action.yml .github/actions/inner/action.yaml).each do |path|
+            stub_request(:get, url + "#{path}?ref=sha")
+              .to_return(status: 200,
+                         body: contents_json(path, "runs: {}\n"),
+                         headers: { "content-type" => "application/json" })
+          end
+        end
+
+        it "fetches every action definition as a support file" do
+          support = file_fetcher_instance.files.select(&:support_file?)
+          expect(support.map(&:path)).to contain_exactly(
+            "/tools/setup/action.yml",
+            "/.github/actions/inner/action.yaml"
+          )
+        end
+
+        context "with a quoted uses key" do
+          let(:workflow_file_fixture) do
+            contents_json(".github/workflows/ci.yml", "jobs:\n  a:\n    steps:\n      - \"uses\": \"$/tools/setup\"\n")
+          end
+
+          it "still fetches the action definitions" do
+            expect(file_fetcher_instance.files.count(&:support_file?)).to eq(2)
+          end
+        end
+      end
+
+      context "when the experiment is disabled" do
+        before { Dependabot::Experiments.reset! }
+
+        it "keeps the existing workflow-only behavior" do
+          expect(file_fetcher_instance.files.map(&:name))
+            .to match_array(
+              %w(.github/workflows/sherlock-workflow.yaml
+                 .github/workflows/integration-workflow.yml)
+            )
+          expect(a_request(:get, url + ".github/workflows/actions.lock?ref=sha")).not_to have_been_made
+        end
+      end
+
+      context "with a non-github.com source" do
+        let(:credentials) do
+          [{
+            "type" => "git_source",
+            "host" => "ghes.other.com",
+            "username" => "x-access-token",
+            "password" => "token"
+          }]
+        end
+        let(:source) do
+          Dependabot::Source.new(
+            provider: "github",
+            repo: "gocardless/bump",
+            directory: directory,
+            hostname: "ghes.other.com",
+            api_endpoint: github_url
+          )
+        end
+
+        it "keeps the existing workflow-only behavior" do
+          expect(file_fetcher_instance.files.map(&:name))
+            .to match_array(
+              %w(.github/workflows/sherlock-workflow.yaml
+                 .github/workflows/integration-workflow.yml)
+            )
+          expect(a_request(:get, url + ".github/workflows/actions.lock?ref=sha")).not_to have_been_made
+        end
+      end
+
+      context "with a ghe.com source" do
+        let(:credentials) do
+          [{
+            "type" => "git_source",
+            "host" => "tenant.ghe.com",
+            "username" => "x-access-token",
+            "password" => "token"
+          }]
+        end
+        let(:source) do
+          Dependabot::Source.new(
+            provider: "github",
+            repo: "gocardless/bump",
+            directory: directory,
+            hostname: "tenant.ghe.com",
+            api_endpoint: github_url
+          )
+        end
+
+        it "fetches the lockfile" do
+          expect(file_fetcher_instance.files.map(&:name)).to include(".github/workflows/actions.lock")
+        end
+      end
     end
 
     context "when it has an invalid encoding" do
@@ -120,6 +293,25 @@ RSpec.describe Dependabot::GithubActions::FileFetcher do
         expect(file_fetcher_instance.files.count).to eq(1)
         expect(file_fetcher_instance.files.map(&:name))
           .to match_array(%w(.github/workflows/integration-workflow.yml))
+      end
+
+      context "when an actions.lock is present" do
+        before do
+          Dependabot::Experiments.register(:github_actions_lockfile, true)
+          stub_request(:get, url + ".github/workflows?ref=sha")
+            .with(headers: { "Authorization" => "token token" })
+            .to_return(
+              status: 200,
+              body: fixture("github", "contents_githubaction_repo_workflows_with_lock.json"),
+              headers: { "content-type" => "application/json" }
+            )
+        end
+
+        it "keeps the workflow-only path" do
+          expect(file_fetcher_instance.files.map(&:name))
+            .to contain_exactly(".github/workflows/integration-workflow.yml")
+          expect(a_request(:get, url + ".github/workflows/actions.lock?ref=sha")).not_to have_been_made
+        end
       end
     end
 
@@ -277,6 +469,103 @@ RSpec.describe Dependabot::GithubActions::FileFetcher do
         .to match_array(
           %w(action.yaml)
         )
+      expect(a_request(:get, url + "action/subdir/actions.lock?ref=sha")).not_to have_been_made
+    end
+  end
+
+  context "with a composite action directory and an actions.lock" do
+    let(:directory) { "/.github/actions/inner" }
+
+    def contents_json(path, content)
+      { type: "file", name: File.basename(path), path: path, encoding: "base64",
+        content: Base64.encode64(content) }.to_json
+    end
+
+    def listing_json(*paths)
+      paths.map { |path| { type: "file", name: File.basename(path), path: path } }.to_json
+    end
+
+    before do
+      Dependabot::Experiments.register(:github_actions_lockfile, true)
+      {
+        ".github/actions/inner" => listing_json(".github/actions/inner/action.yml"),
+        ".github/actions/inner/action.yml" =>
+          contents_json(".github/actions/inner/action.yml", "runs:\n  using: composite\n"),
+        ".github/workflows" => listing_json(".github/workflows/ci.yml", ".github/workflows/actions.lock"),
+        ".github/workflows/ci.yml" =>
+          contents_json(".github/workflows/ci.yml", "jobs:\n  a:\n    steps:\n      - uses: $/.github/actions/inner\n"),
+        ".github/workflows/actions.lock" => contents_json(".github/workflows/actions.lock", "version: v0.0.3\n"),
+        ".github/actions/outer/action.yml" => contents_json(".github/actions/outer/action.yml", "runs: {}\n")
+      }.each do |path, body|
+        stub_request(:get, url + "#{path}?ref=sha")
+          .to_return(status: 200, body: body, headers: { "content-type" => "application/json" })
+      end
+      stub_request(:get, github_url + "repos/gocardless/bump/git/trees/sha?recursive=true")
+        .to_return(
+          status: 200,
+          headers: { "content-type" => "application/json" },
+          body: { truncated: false, tree: [
+            { path: ".github/actions/inner/action.yml", type: "blob" },
+            { path: ".github/actions/outer/action.yml", type: "blob" }
+          ] }.to_json
+        )
+    end
+
+    it "fetches the root lockfile, workflows and $/ actions without making them dependency sources" do
+      files = file_fetcher_instance.files
+      expect(files.map { |f| [f.path, f.support_file?] }).to contain_exactly(
+        ["/.github/actions/inner/action.yml", false],
+        ["/.github/workflows/actions.lock", false],
+        ["/.github/workflows/ci.yml", true],
+        ["/.github/actions/outer/action.yml", true]
+      )
+    end
+
+    context "when the repository has no lockfile" do
+      before do
+        stub_request(:get, url + ".github/workflows?ref=sha")
+          .to_return(
+            status: 200,
+            body: listing_json(".github/workflows/ci.yml"),
+            headers: { "content-type" => "application/json" }
+          )
+      end
+
+      it "fetches only the composite action" do
+        expect(file_fetcher_instance.files.map(&:path)).to eq(["/.github/actions/inner/action.yml"])
+      end
+    end
+
+    context "when the experiment is disabled" do
+      before { Dependabot::Experiments.reset! }
+
+      it "fetches only the composite action" do
+        expect(file_fetcher_instance.files.map(&:path)).to eq(["/.github/actions/inner/action.yml"])
+        expect(a_request(:get, url + ".github/workflows/actions.lock?ref=sha")).not_to have_been_made
+      end
+    end
+
+    context "when a repository workflow is invalidly encoded" do
+      before do
+        stub_request(:get, url + ".github/workflows?ref=sha")
+          .to_return(
+            status: 200,
+            body: listing_json(
+              ".github/workflows/ci.yml", ".github/workflows/bad.yml", ".github/workflows/actions.lock"
+            ),
+            headers: { "content-type" => "application/json" }
+          )
+        stub_request(:get, url + ".github/workflows/bad.yml?ref=sha")
+          .to_return(
+            status: 200,
+            body: contents_json(".github/workflows/bad.yml", "\xFF\xFE".b),
+            headers: { "content-type" => "application/json" }
+          )
+      end
+
+      it "fetches only the composite action" do
+        expect(file_fetcher_instance.files.map(&:path)).to eq(["/.github/actions/inner/action.yml"])
+      end
     end
   end
 end

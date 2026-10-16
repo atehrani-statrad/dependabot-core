@@ -9,10 +9,17 @@
 
 import {
   readWantedLockfile,
+  type CatalogSnapshots,
   type PackageSnapshot,
   type ProjectSnapshot,
 } from "@pnpm/lockfile-file";
 import * as dependencyPath from "@pnpm/dependency-path";
+import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+const YAML_DOCUMENT_START = "---\n";
+const YAML_DOCUMENT_SEPARATOR = "\n---\n";
 
 interface PnpmDependency {
   name: string;
@@ -24,9 +31,7 @@ interface PnpmDependency {
 }
 
 export async function parse(directory: string): Promise<PnpmDependency[]> {
-  const lockfile = await readWantedLockfile(directory, {
-    ignoreIncompatible: true,
-  });
+  const lockfile = await readLockfile(directory);
 
   if (!lockfile) {
     return [];
@@ -41,15 +46,75 @@ export async function parse(directory: string): Promise<PnpmDependency[]> {
       nameVerDevFromPkgSnapshot(
         depPath,
         pkgSnapshot,
-        Object.values(lockfile.importers)
+        Object.values(lockfile.importers),
+        lockfile.catalogs
       )
     );
+}
+
+async function readLockfile(directory: string) {
+  const content = await readLockfileContent(directory);
+  // pnpm 11 can prepend an environment lockfile before the project lockfile.
+  const mainDocument = content === null ? null : extractMainDocument(content);
+
+  if (mainDocument === null) {
+    return readWantedLockfile(directory, {
+      ignoreIncompatible: true,
+    });
+  }
+
+  const tempDirectory = await mkdtemp(
+    path.join(os.tmpdir(), "dependabot-pnpm-lockfile-")
+  );
+
+  try {
+    await writeFile(
+      path.join(tempDirectory, "pnpm-lock.yaml"),
+      mainDocument,
+      "utf8"
+    );
+    return await readWantedLockfile(tempDirectory, {
+      ignoreIncompatible: true,
+    });
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
+  }
+}
+
+async function readLockfileContent(directory: string): Promise<string | null> {
+  try {
+    return await readFile(path.join(directory, "pnpm-lock.yaml"), "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+
+    throw error;
+  }
+}
+
+function extractMainDocument(content: string): string | null {
+  content = content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+  if (!content.startsWith(YAML_DOCUMENT_START)) {
+    return null;
+  }
+
+  const separatorIndex = content.indexOf(
+    YAML_DOCUMENT_SEPARATOR,
+    YAML_DOCUMENT_START.length
+  );
+  if (separatorIndex === -1) {
+    return null;
+  }
+
+  return content.slice(separatorIndex + YAML_DOCUMENT_SEPARATOR.length);
 }
 
 function nameVerDevFromPkgSnapshot(
   depPath: string,
   pkgSnapshot: PackageSnapshot,
-  projectSnapshots: ProjectSnapshot[]
+  projectSnapshots: ProjectSnapshot[],
+  catalogs: CatalogSnapshots | undefined
 ): PnpmDependency {
   let name: string;
   let version: string;
@@ -101,6 +166,22 @@ function nameVerDevFromPkgSnapshot(
 
     return true;
   });
+
+  // An importer that takes a dependency from a catalog records its specifier as
+  // the literal "catalog:" (or "catalog:<name>"), never the version range the
+  // catalog resolves to. That range lives in the lockfile's own `catalogs` block,
+  // and it is also the form a pnpm-workspace.yaml catalog entry is read as, so
+  // collect it here too. Without it a catalogued package is only ever matched by
+  // a caller that already knows to ask for "catalog:".
+  if (!aliased) {
+    for (const catalog of Object.values(catalogs ?? {})) {
+      const entry = catalog[name];
+
+      if (entry?.version === version && !specifiers.includes(entry.specifier)) {
+        specifiers.push(entry.specifier);
+      }
+    }
+  }
 
   return {
     name: name,

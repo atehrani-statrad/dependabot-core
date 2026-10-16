@@ -1,6 +1,8 @@
 # typed: false
 # frozen_string_literal: true
 
+# Sorbet cannot resolve the dependency fixture defined only in child contexts.
+
 require "spec_helper"
 require "dependabot/deno/metadata_finder"
 require "dependabot/dependency"
@@ -52,7 +54,7 @@ RSpec.describe Dependabot::Deno::MetadataFinder do
           requirement: "^5.3.0",
           file: "deno.json",
           groups: ["imports"],
-          source: { type: "npm" }
+          source: { "type" => "npm" }
         }],
         package_manager: "deno"
       )

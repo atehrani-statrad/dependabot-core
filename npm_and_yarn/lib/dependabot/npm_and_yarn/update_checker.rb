@@ -12,6 +12,9 @@ module Dependabot
     class UpdateChecker < Dependabot::UpdateCheckers::Base # rubocop:disable Metrics/ClassLength
       extend T::Sig
 
+      Audit = Dependabot::UpdateCheckers::VulnerabilityAudit
+      FixUpdate = Dependabot::UpdateCheckers::VulnerabilityAudit::FixUpdate
+
       require_relative "update_checker/requirements_updater"
       require_relative "update_checker/library_detector"
       require_relative "update_checker/latest_version_finder"
@@ -52,7 +55,7 @@ module Dependabot
         @latest_version = T.let(nil, T.nilable(T.any(String, Gem::Version)))
         @latest_resolvable_version = T.let(nil, T.nilable(T.any(String, Dependabot::Version)))
         @updated_requirements = T.let(nil, T.nilable(T::Array[Dependabot::DependencyRequirement]))
-        @vulnerability_audit = T.let(nil, T.nilable(T::Hash[String, T.untyped]))
+        @vulnerability_audit = T.let(nil, T.nilable(Audit))
         @vulnerable_versions = T.let(nil, T.nilable(T::Array[T.any(String, Gem::Version)]))
 
         @latest_version_for_git_dependency = T.let(nil, T.nilable(T.any(String, Gem::Version)))
@@ -65,6 +68,9 @@ module Dependabot
         @package_json = T.let(nil, T.nilable(Dependabot::DependencyFile))
         @git_commit_checker = T.let(nil, T.nilable(Dependabot::GitCommitChecker))
         super
+        Helpers.dependency_files = dependency_files
+        Helpers.credentials = credentials
+        Helpers.activate_npm_version_selector(dependency_files)
         apply_npmrc_min_release_age
       end
 
@@ -117,9 +123,9 @@ module Dependabot
       sig { override.returns(T.nilable(Dependabot::Version)) }
       def lowest_security_fix_version
         # This will require a full unlock to update multiple top level ancestors.
-        return if vulnerability_audit["fix_available"] && vulnerability_audit["top_level_ancestors"].count > 1
+        return if vulnerability_audit.fix_available && vulnerability_audit.top_level_ancestors.count > 1
 
-        T.unsafe(latest_version_finder.lowest_security_fix_version)
+        latest_version_finder.lowest_security_fix_version
       end
 
       sig { override.returns(T.nilable(Dependabot::Version)) }
@@ -156,10 +162,10 @@ module Dependabot
 
       sig do
         params(updated_version: T.any(String, Gem::Version))
-          .returns(T.nilable(T.any(String, T.untyped)))
+          .returns(T.nilable(T.any(String, Gem::Version)))
       end
       def latest_resolvable_previous_version(updated_version)
-        T.unsafe(version_resolver.latest_resolvable_previous_version(updated_version))
+        version_resolver.latest_resolvable_previous_version(updated_version)
       end
 
       sig { override.returns(T::Array[Dependabot::DependencyRequirement]) }
@@ -177,14 +183,12 @@ module Dependabot
           end
 
         @updated_requirements ||=
-          wrap_requirements(
-            RequirementsUpdater.new(
-              requirements: dependency.requirements,
-              updated_source: updated_source,
-              latest_resolvable_version: resolvable_version,
-              update_strategy: T.must(requirements_update_strategy)
-            ).updated_requirements
-          )
+          RequirementsUpdater.new(
+            requirements: dependency.requirements,
+            updated_source: updated_source,
+            latest_resolvable_version: resolvable_version,
+            update_strategy: T.must(requirements_update_strategy)
+          ).updated_requirements
       end
 
       sig { returns(T::Boolean) }
@@ -201,7 +205,7 @@ module Dependabot
         library? ? RequirementsUpdateStrategy::WidenRanges : RequirementsUpdateStrategy::BumpVersions
       end
 
-      sig { override.returns(T::Array[T::Hash[String, String]]) }
+      sig { override.returns(T::Array[Dependabot::UpdateCheckers::Conflict]) }
       def conflicting_dependencies
         conflicts = ConflictingDependencyResolver.new(
           dependency_files: dependency_files,
@@ -212,9 +216,8 @@ module Dependabot
         )
         return conflicts unless vulnerability_audit_performed?
 
-        vulnerable = [vulnerability_audit].select do |hash|
-          !hash["fix_available"] && hash["explanation"]
-        end
+        audit = vulnerability_audit
+        vulnerable = !audit.fix_available && audit.explanation ? [audit.to_h] : []
 
         conflicts + vulnerable
       end
@@ -226,7 +229,7 @@ module Dependabot
         !!defined?(@vulnerability_audit)
       end
 
-      sig { returns(T::Hash[String, T.untyped]) }
+      sig { returns(Audit) }
       def vulnerability_audit
         @vulnerability_audit ||=
           VulnerabilityAuditor.new(
@@ -259,12 +262,12 @@ module Dependabot
 
         return false unless security_advisories.any?
 
-        vulnerability_audit["fix_available"]
+        vulnerability_audit.fix_available
       end
 
       sig { override.returns(T::Array[Dependabot::Dependency]) }
       def updated_dependencies_after_full_unlock
-        return conflicting_updated_dependencies if security_advisories.any? && vulnerability_audit["fix_available"]
+        return conflicting_updated_dependencies if security_advisories.any? && vulnerability_audit.fix_available
 
         T.must(version_resolver.dependency_updates_from_full_unlock)
          .map { |update_details| build_updated_dependency(update_details.transform_keys(&:to_sym)) }
@@ -275,10 +278,10 @@ module Dependabot
       def conflicting_updated_dependencies
         top_level_dependencies = top_level_dependency_lookup
 
-        updated_deps = vulnerability_audit["fix_updates"].filter_map do |update|
-          next log_skipped_fix_update(update) if update["target_version"] == update["current_version"]
+        updated_deps = vulnerability_audit.fix_updates.filter_map do |update|
+          next log_skipped_fix_update(update) if update.target_version == update.current_version
 
-          dependency_name = update["dependency_name"]
+          dependency_name = update.dependency_name
           requirements = requirements_for_update(top_level_dependencies, update)
 
           build_updated_dependency(
@@ -287,8 +290,8 @@ module Dependabot
               package_manager: "npm_and_yarn",
               requirements: requirements
             ),
-            version: update["target_version"],
-            previous_version: update["current_version"]
+            version: update.target_version,
+            previous_version: update.current_version
           )
         end
         # rubocop:enable Metrics/AbcSize
@@ -298,7 +301,7 @@ module Dependabot
         # to include it so it's described in the PR and we'll pass validation
         # that this dependency is at a non-vulnerable version.
         if updated_deps.none? { |dep| dep.name == dependency.name }
-          target_version = vulnerability_audit["target_version"]
+          target_version = vulnerability_audit.target_version
           updated_deps << build_updated_dependency(
             dependency: dependency,
             version: target_version,
@@ -314,11 +317,11 @@ module Dependabot
           updated_deps.reject { |dep| dep.name == dependency.name }
       end
 
-      sig { params(update: T::Hash[String, T.untyped]).returns(NilClass) }
+      sig { params(update: FixUpdate).returns(NilClass) }
       def log_skipped_fix_update(update)
         Dependabot.logger.info(
-          "#{update['dependency_name']} is already at the target version " \
-          "(#{update['current_version']}), no update needed"
+          "#{update.dependency_name} is already at the target version " \
+          "(#{update.current_version}), no update needed"
         )
         nil
       end
@@ -326,12 +329,12 @@ module Dependabot
       sig do
         params(
           top_level_dependencies: T::Hash[String, Dependabot::Dependency],
-          update: T::Hash[String, T.untyped]
-        ).returns(T::Array[T::Hash[Symbol, T.untyped]])
+          update: FixUpdate
+        ).returns(T::Array[Dependabot::DependencyRequirement])
       end
       def requirements_for_update(top_level_dependencies, update)
-        dependency_name = update["dependency_name"]
-        if top_level_dependencies[dependency_name]&.version == update["current_version"]
+        dependency_name = update.dependency_name
+        if top_level_dependencies[dependency_name]&.version == update.current_version
           top_level_dependencies[dependency_name]&.requirements || []
         else
           []
@@ -397,9 +400,10 @@ module Dependabot
       sig { returns(T.nilable(T.any(String, Dependabot::Version))) }
       def latest_resolvable_version_with_no_unlock_for_git_dependency
         reqs = dependency.requirements.filter_map do |r|
-          next if r.fetch(:requirement).nil?
+          requirement = r.requirement_string
+          next if requirement.nil?
 
-          requirement_class.requirements_array(r.fetch(:requirement))
+          requirement_class.requirements_array(requirement)
         end
 
         current_version =
@@ -422,10 +426,8 @@ module Dependabot
       def latest_version_for_git_dependency
         @latest_version_for_git_dependency ||=
           if version_class.correct?(dependency.version)
-            T.unsafe(
-              latest_git_version_details[:version] &&
-                            version_class.new(latest_git_version_details[:version])
-            )
+            version = latest_git_version_details[:version]
+            version && version_class.new(version)
           else
             latest_git_version_details[:sha]
           end
@@ -485,7 +487,8 @@ module Dependabot
             dependency_files: dependency_files,
             ignored_versions: ignored_versions,
             latest_allowable_version: latest_version,
-            repo_contents_path: repo_contents_path
+            repo_contents_path: repo_contents_path,
+            security_advisories: security_advisories
           )
       end
 
@@ -494,20 +497,20 @@ module Dependabot
         git_commit_checker.git_dependency?
       end
 
-      sig { returns(T::Hash[Symbol, T.untyped]) }
+      sig { returns(T::Hash[Symbol, T.nilable(String)]) }
       def latest_git_version_details
         semver_req =
           dependency.requirements
-                    .find { |req| req.dig(:source, :type) == "git" }
-                    &.fetch(:requirement)
+                    .find { |req| req.source_string("type") == "git" }
+                    &.requirement_string
 
         # If there was a semver requirement provided or the dependency was
         # pinned to a version, look for the latest tag
         if semver_req || git_commit_checker.pinned_ref_looks_like_version?
-          latest_tag = git_commit_checker.local_tag_for_latest_version
+          latest_tag = git_commit_checker.local_tag_for_latest_version(update_cooldown)
           return {
-            sha: latest_tag&.fetch(:commit_sha),
-            version: latest_tag&.fetch(:tag)&.gsub(/^[^\d]*/, "")
+            sha: latest_tag&.commit_sha,
+            version: latest_tag&.tag&.gsub(/^[^\d]*/, "")
           }
         end
 
@@ -520,16 +523,16 @@ module Dependabot
         { sha: dependency.version }
       end
 
-      sig { returns(T.nilable(T::Hash[Symbol, T.untyped])) }
+      sig { returns(T.nilable(Dependabot::DependencyRequirement::ObjectHash)) }
       def updated_source
         # Never need to update source, unless a git_dependency
         return dependency_source_details unless git_dependency?
 
         # Update the git tag if updating a pinned version
         if git_commit_checker.pinned_ref_looks_like_version? &&
-           !git_commit_checker.local_tag_for_latest_version.nil?
-          new_tag = git_commit_checker.local_tag_for_latest_version
-          return dependency_source_details&.merge(ref: new_tag&.fetch(:tag))
+           !git_commit_checker.local_tag_for_latest_version(update_cooldown).nil?
+          new_tag = git_commit_checker.local_tag_for_latest_version(update_cooldown)
+          return dependency_source_details&.merge(ref: new_tag&.tag)
         end
 
         # Otherwise return the original source
@@ -554,40 +557,54 @@ module Dependabot
         security_advisories.any?
       end
 
-      sig { returns(T.nilable(T::Hash[Symbol, T.untyped])) }
+      sig { returns(T.nilable(Dependabot::DependencyRequirement::ObjectHash)) }
       def dependency_source_details
         original_source(dependency)
       end
 
       sig do
         params(updated_dependency: Dependabot::Dependency)
-          .returns(T.nilable(T::Hash[Symbol, T.untyped]))
+          .returns(T.nilable(Dependabot::DependencyRequirement::ObjectHash))
       end
       def original_source(updated_dependency)
         sources =
           updated_dependency
-          .requirements.map { |r| r.fetch(:source) }
-                       .uniq.compact
+          .requirements.map(&:source_hash)
+          .uniq.compact
           .sort_by do |source|
-            Package::RegistryFinder.central_registry?(source[:url]) ? 1 : 0
+            Package::RegistryFinder.central_registry?(T.cast(source[:url], String)) ? 1 : 0
           end
 
         sources.first
       end
 
       # Reads `min-release-age` from .npmrc and applies it as a floor for every
-      # cooldown field. npm enforces this constraint at install time, so any version
-      # younger than the threshold will cause `npm install` to fail. When a
-      # dependabot.yml cooldown is also present, the npmrc value raises any field
-      # that is below it and leaves higher values unchanged. Include/exclude patterns
-      # are always dropped because npm applies min-release-age globally with no
-      # per-package filtering.
+      # cooldown field: the higher of `min-release-age` and the dependabot.yml
+      # cooldown wins. npm enforces this constraint at install time, so any version
+      # younger than the threshold will cause `npm install` to fail. Include/exclude
+      # patterns are always dropped because npm applies min-release-age globally with
+      # no per-package filtering.
       sig { void }
       def apply_npmrc_min_release_age
         npmrc_days = npmrc_min_release_age_days
         return unless npmrc_days&.positive?
 
+        # Security fixes must not be blocked by a release-age gate the user
+        # configured for regular updates. npm install/update is invoked with
+        # --min-release-age=0 for security updates, so the cooldown floor would
+        # only filter out the security fix version at selection time.
+        if security_update?
+          Dependabot.logger.info(
+            ".npmrc min-release-age (#{npmrc_days} days) is bypassed for this security update."
+          )
+          return
+        end
+
         if @update_cooldown.nil?
+          Dependabot.logger.info(
+            ".npmrc min-release-age (#{npmrc_days} days) is applied as the cooldown because " \
+            "no dependabot.yml cooldown is configured."
+          )
           @update_cooldown = Dependabot::Package::ReleaseCooldownOptions.new(default_days: npmrc_days)
         else
           existing = @update_cooldown
@@ -613,9 +630,9 @@ module Dependabot
         all_days = [existing.default_days, existing.semver_major_days,
                     existing.semver_minor_days, existing.semver_patch_days]
         unless all_days.any? { |days| days < npmrc_days }
-          Dependabot.logger.debug(
+          Dependabot.logger.info(
             ".npmrc min-release-age (#{npmrc_days} days) is already satisfied by all " \
-            "dependabot.yml update_cooldown values; no adjustment needed."
+            "dependabot.yml update_cooldown values; the dependabot.yml cooldown is used."
           )
           return
         end
@@ -653,35 +670,36 @@ module Dependabot
         )
       end
 
+      NPMRC_MIN_RELEASE_AGE_SETTING =
+        Helpers::ReleaseAgeGateSetting.new(filename: ".npmrc", key: "min-release-age", separator: "=")
+      private_constant :NPMRC_MIN_RELEASE_AGE_SETTING
+
+      # Resolves each .npmrc with the same parsing as the lockfile updater (the last matching
+      # line wins) and keeps the largest numeric value across files, so the version chosen
+      # here is never younger than a gate npm can enforce. A non-numeric value only discards
+      # that file's gate: it must not hide a numeric gate set in another file. (The updater
+      # instead treats such a value as an unreadable gate it must never override.)
       sig { returns(T.nilable(Integer)) }
       def npmrc_min_release_age_days
-        npmrc_file = dependency_files.find { |f| File.basename(f.name) == ".npmrc" }
-        unless npmrc_file&.content
-          Dependabot.logger.debug("No .npmrc file found; skipping min-release-age check.")
+        npmrc_files = dependency_files.select { |file| File.basename(file.name) == ".npmrc" }
+        configured = npmrc_files.filter_map { |file| numeric_min_release_age(file) }.max
+
+        if configured.nil?
+          Dependabot.logger.debug("No numeric min-release-age found in any .npmrc file.")
           return nil
         end
 
-        T.must(npmrc_file.content).split("\n").each do |line|
-          days = parse_min_release_age_line(line, npmrc_file.name)
-          return days if days
-        end
-        Dependabot.logger.debug("No min-release-age key found in #{npmrc_file.name}.")
-        nil
+        Dependabot.logger.debug("Found min-release-age=#{configured} days in .npmrc.")
+        configured
       end
 
-      sig { params(line: String, filename: String).returns(T.nilable(Integer)) }
-      def parse_min_release_age_line(line, filename)
-        key, value = line.strip.split("=", 2)
-        return nil unless key&.strip == "min-release-age" && value
+      sig { params(npmrc: Dependabot::DependencyFile).returns(T.nilable(Integer)) }
+      def numeric_min_release_age(npmrc)
+        value = Helpers.max_configured_release_age([npmrc], [NPMRC_MIN_RELEASE_AGE_SETTING])
+        return value if value.is_a?(Integer)
 
-        parsed = T.let(Integer(value.strip, 10, exception: false), T.nilable(Integer))
-        if parsed&.positive?
-          Dependabot.logger.debug("Found min-release-age=#{parsed} days in #{filename}.")
-          parsed
-        else
-          Dependabot.logger.debug("Ignoring invalid min-release-age value '#{value.strip}' in #{filename}.")
-          nil
-        end
+        Dependabot.logger.debug("Ignoring non-numeric min-release-age value in #{npmrc.name}.") if value
+        nil
       end
 
       sig { returns(T.nilable(Dependabot::DependencyFile)) }

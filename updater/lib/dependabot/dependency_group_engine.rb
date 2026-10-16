@@ -25,10 +25,7 @@ module Dependabot
 
     class ConfigurationError < StandardError; end
 
-    PACKAGE_MANAGERS_SUPPORTING_DEPENDENCY_TYPE = T.let(
-      %w(bundler composer hex maven npm_and_yarn pip uv silent).freeze,
-      T::Array[String]
-    )
+    PACKAGE_MANAGERS_SUPPORTING_DEPENDENCY_TYPE = %w(bundler composer hex maven npm_and_yarn pip uv silent).freeze
 
     sig { params(job: Dependabot::Job).returns(Dependabot::DependencyGroupEngine) }
     def self.from_job_config(job:)
@@ -196,10 +193,10 @@ module Dependabot
       # Groups with update-types rules are complementary, not competing.
       # Filter out groups with non-overlapping update-types so they don't
       # prevent each other from receiving dependencies during assignment.
-      current_update_types = T.cast(group.rules["update-types"], T.nilable(T::Array[String]))
+      current_update_types = group.update_types
       eligible_groups = if current_update_types
                           @dependency_groups.reject do |other|
-                            other_update_types = T.cast(other.rules["update-types"], T.nilable(T::Array[String]))
+                            other_update_types = other.update_types
                             next false unless other_update_types
 
                             !current_update_types.intersect?(other_update_types)
@@ -235,7 +232,10 @@ module Dependabot
         matching_deps = dependencies.select { |dep| parent_group.contains?(dep) }
 
         matching_deps.group_by(&:name).each do |dep_name, deps|
-          subgroup_name = "#{parent_group.name}/#{dep_name}"
+          subgroup_name = Dependabot::DependencyGroup.subgroup_name(
+            parent_name: parent_group.name,
+            dependency_name: dep_name
+          )
           existing_subgroup = @dependency_groups.find { |g| g.name == subgroup_name }
 
           if existing_subgroup

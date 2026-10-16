@@ -7,7 +7,6 @@ require "sorbet-runtime"
 
 require "dependabot/errors"
 require "dependabot/shared_helpers"
-require "dependabot/update_checkers/cooldown_calculation"
 require "dependabot/update_checkers/version_filters"
 require "dependabot/package/package_latest_version_finder"
 require "dependabot/git_submodules/update_checker"
@@ -46,49 +45,14 @@ module Dependabot
             )
         end
 
-        sig { params(release: Dependabot::Package::PackageRelease).returns(T::Boolean) }
-        def in_cooldown_period?(release)
-          unless release.released_at
-            Dependabot.logger.info("Release date not available for ref tag #{release.tag}")
-            return false
-          end
+        private
 
-          days = cooldown_days
-          in_cooldown = Dependabot::UpdateCheckers::CooldownCalculation
-                        .within_cooldown_window?(T.must(release.released_at), days)
-
-          if in_cooldown
-            passed_days = (Time.now.to_i - release.released_at.to_i) / (24 * 60 * 60)
-            Dependabot.logger.info(
-              "Filtered #{release.tag}, Released on: " \
-              "#{T.must(release.released_at).strftime('%Y-%m-%d')} " \
-              "(#{passed_days}/#{days} cooldown days)"
-            )
-          end
-
-          in_cooldown
-        end
-
-        sig do
-          returns(Integer)
-        end
-        def cooldown_days
-          cooldown = @cooldown_options
-          return 0 if cooldown.nil?
-          return 0 unless cooldown_enabled?
-          return 0 unless cooldown.included?(dependency.name)
-
-          return cooldown.default_days if cooldown.default_days.positive?
-          return cooldown.semver_major_days if cooldown.semver_major_days.positive?
-          return cooldown.semver_minor_days if cooldown.semver_minor_days.positive?
-          return cooldown.semver_patch_days if cooldown.semver_patch_days.positive?
-
-          cooldown.default_days
-        end
-
-        sig { returns(T::Boolean) }
-        def cooldown_enabled?
-          true
+        sig { override.returns(Dependabot::Package::PackageRelease) }
+        def cooldown_fallback_release
+          Dependabot::Package::PackageRelease.new(
+            version: GitSubmodules::Version.new("0.0.0-0.0"),
+            tag: dependency.version
+          )
         end
 
         sig do

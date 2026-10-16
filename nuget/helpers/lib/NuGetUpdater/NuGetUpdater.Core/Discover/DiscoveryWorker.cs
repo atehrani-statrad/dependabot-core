@@ -88,9 +88,19 @@ public partial class DiscoveryWorker : IDiscoveryWorker
         ImmutableArray<ProjectDiscoveryResult> projectResults = [];
         WorkspaceDiscoveryResult result;
 
+        // if the workspace directory directly contains a solution file, capture its directory so that the MSBuild
+        // `SolutionDir` property can be faked during discovery; this allows project files that reference
+        // `$(SolutionDir)` to be evaluated correctly
+        string? solutionDir = null;
+
         if (Directory.Exists(workspacePath))
         {
             _logger.Info($"Discovering build files in workspace [{workspacePath}].");
+
+            if (DirectoryContainsSolutionFile(workspacePath))
+            {
+                solutionDir = workspacePath;
+            }
 
             dotNetToolsJsonDiscovery = DotNetToolsJsonDiscovery.Discover(repoRootPath, workspacePath, _logger);
             globalJsonDiscovery = GlobalJsonDiscovery.Discover(repoRootPath, workspacePath, _logger);
@@ -101,7 +111,7 @@ public partial class DiscoveryWorker : IDiscoveryWorker
             }
 
             // this next line should throw or something
-            projectResults = await RunForDirectoryAsync(repoRootPath, workspacePath);
+            projectResults = await RunForDirectoryAsync(repoRootPath, workspacePath, solutionDir);
         }
         else
         {
@@ -149,6 +159,7 @@ public partial class DiscoveryWorker : IDiscoveryWorker
                 DotNetToolsJson = null,
                 GlobalJson = null,
                 Projects = projectResults.Where(p => p.IsSuccess).OrderBy(p => p.FilePath).ToImmutableArray(),
+                SolutionDirectory = GetRelativeSolutionDirectory(repoRootPath, solutionDir),
                 Error = failedProjectResult.Error,
                 IsSuccess = false,
             };
@@ -162,6 +173,7 @@ public partial class DiscoveryWorker : IDiscoveryWorker
             DotNetToolsJson = dotNetToolsJsonDiscovery,
             GlobalJson = globalJsonDiscovery,
             Projects = projectResults.OrderBy(p => p.FilePath).ToImmutableArray(),
+            SolutionDirectory = GetRelativeSolutionDirectory(repoRootPath, solutionDir),
         };
 
         _logger.Info("Discovery complete.");
@@ -196,7 +208,7 @@ public partial class DiscoveryWorker : IDiscoveryWorker
         return await NuGetHelper.DownloadNuGetPackagesAsync(repoRootPath, workspacePath, msbuildSdks, logger);
     }
 
-    private async Task<ImmutableArray<ProjectDiscoveryResult>> RunForDirectoryAsync(string repoRootPath, string workspacePath)
+    private async Task<ImmutableArray<ProjectDiscoveryResult>> RunForDirectoryAsync(string repoRootPath, string workspacePath, string? solutionDir)
     {
         _logger.Info($"  Discovering projects beneath [{Path.GetRelativePath(repoRootPath, workspacePath)}].");
         var entryPoints = FindEntryPoints(workspacePath);
@@ -227,7 +239,24 @@ public partial class DiscoveryWorker : IDiscoveryWorker
             return [];
         }
 
-        return await RunForProjectPathsAsync(repoRootPath, workspacePath, projects);
+        return await RunForProjectPathsAsync(repoRootPath, workspacePath, projects, solutionDir);
+    }
+
+    private static bool DirectoryContainsSolutionFile(string directoryPath)
+    {
+        return Directory.EnumerateFiles(directoryPath)
+            .Any(path =>
+            {
+                string extension = Path.GetExtension(path).ToLowerInvariant();
+                return extension is ".sln" or ".slnx";
+            });
+    }
+
+    private static string? GetRelativeSolutionDirectory(string repoRootPath, string? solutionDir)
+    {
+        return solutionDir is null
+            ? null
+            : Path.GetRelativePath(repoRootPath, solutionDir).NormalizePathToUnix();
     }
 
     private static ImmutableArray<string> FindEntryPoints(string workspacePath)
@@ -256,7 +285,12 @@ public partial class DiscoveryWorker : IDiscoveryWorker
     {
         HashSet<string> expandedProjects = new(PathComparer.Instance);
         HashSet<string> seenProjects = new(PathComparer.Instance);
-        Stack<string> filesToExpand = new(entryPoints);
+        Stack<string> filesToExpand = new();
+        foreach (string entryPoint in entryPoints)
+        {
+            PushExistingPaths(filesToExpand, entryPoint, repoRootPath);
+        }
+
         while (filesToExpand.Count > 0)
         {
             string candidateEntryPoint = filesToExpand.Pop();
@@ -270,7 +304,7 @@ public partial class DiscoveryWorker : IDiscoveryWorker
                     foreach (ProjectInSolution project in solution.ProjectsInOrder)
                     {
                         logger.Info($"      Expanded project: {project.AbsolutePath}");
-                        filesToExpand.Push(project.AbsolutePath);
+                        PushExistingPaths(filesToExpand, project.AbsolutePath, repoRootPath);
                     }
                 }
                 else if (extension == ".slnx")
@@ -292,7 +326,7 @@ public partial class DiscoveryWorker : IDiscoveryWorker
                     {
                         string projectPath = Path.Combine(solutionPath, project.FilePath);
                         logger.Info($"      Expanded project: {projectPath}");
-                        filesToExpand.Push(projectPath);
+                        PushExistingPaths(filesToExpand, projectPath, repoRootPath);
                     }
                 }
                 else if (extension == ".proj")
@@ -302,7 +336,7 @@ public partial class DiscoveryWorker : IDiscoveryWorker
                     foreach (var foundProject in foundProjects)
                     {
                         logger.Info($"      Expanded project: {foundProject}");
-                        filesToExpand.Push(foundProject);
+                        PushExistingPaths(filesToExpand, foundProject, repoRootPath);
                     }
                 }
 
@@ -343,6 +377,18 @@ public partial class DiscoveryWorker : IDiscoveryWorker
         return result;
     }
 
+    private static void PushExistingPaths(Stack<string> filesToExpand, string candidatePath, string repoRootPath)
+    {
+        var resolvedPaths = PathHelper.ResolveCaseInsensitivePathsInsideRepoRoot(candidatePath, repoRootPath);
+        foreach (string resolvedPath in resolvedPaths ?? [])
+        {
+            if (File.Exists(resolvedPath))
+            {
+                filesToExpand.Push(resolvedPath);
+            }
+        }
+    }
+
     private static IEnumerable<string> ExpandItemGroupFilesFromProject(string projectPath, params string[] itemTypes)
     {
         if (!File.Exists(projectPath))
@@ -378,7 +424,7 @@ public partial class DiscoveryWorker : IDiscoveryWorker
         return foundItems;
     }
 
-    private async Task<ImmutableArray<ProjectDiscoveryResult>> RunForProjectPathsAsync(string repoRootPath, string workspacePath, IEnumerable<string> projectPaths)
+    private async Task<ImmutableArray<ProjectDiscoveryResult>> RunForProjectPathsAsync(string repoRootPath, string workspacePath, IEnumerable<string> projectPaths, string? solutionDir)
     {
         var normalizedProjectPaths = projectPaths.SelectMany(p => PathHelper.ResolveCaseInsensitivePathsInsideRepoRoot(p, repoRootPath) ?? []).Distinct().ToImmutableArray();
 
@@ -437,7 +483,7 @@ public partial class DiscoveryWorker : IDiscoveryWorker
                 _processedProjectPaths.Add(projectPath);
 
                 var relativeProjectPath = Path.GetRelativePath(workspacePath, projectPath).NormalizePathToUnix();
-                var projectResults = await SdkProjectDiscovery.DiscoverAsync(repoRootPath, workspacePath, projectPath, _experimentsManager, _logger);
+                var projectResults = await SdkProjectDiscovery.DiscoverAsync(repoRootPath, workspacePath, projectPath, _experimentsManager, solutionDir, _logger);
 
                 // Determine if there were unrestored MSBuildSdks
                 var msbuildSdks = projectResults.SelectMany(p => p.Dependencies.Where(d => d.Type == DependencyType.MSBuildSdk)).ToImmutableArray();
@@ -446,7 +492,7 @@ public partial class DiscoveryWorker : IDiscoveryWorker
                     // If new SDKs were restored, then we need to rerun SdkProjectDiscovery.
                     if (await TryRestoreMSBuildSdksAsync(repoRootPath, workspacePath, msbuildSdks, _logger))
                     {
-                        projectResults = await SdkProjectDiscovery.DiscoverAsync(repoRootPath, workspacePath, projectPath, _experimentsManager, _logger);
+                        projectResults = await SdkProjectDiscovery.DiscoverAsync(repoRootPath, workspacePath, projectPath, _experimentsManager, solutionDir, _logger);
                     }
                 }
 

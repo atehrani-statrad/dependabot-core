@@ -1,4 +1,4 @@
-# typed: false
+# typed: strict
 # frozen_string_literal: true
 
 require "spec_helper"
@@ -95,6 +95,19 @@ RSpec.describe Dependabot::Credential do
       merged = cred1.merge(cred2)
       expect(merged["type"]).to eq("npm_registry")
       expect(merged["token"]).to eq("secret")
+    end
+  end
+
+  describe "value parsing" do
+    it "preserves nil credential values" do
+      cred = described_class.new({ "type" => "git_source", "username" => nil })
+
+      expect(cred.to_h).to eq("type" => "git_source", "username" => nil)
+    end
+
+    it "rejects non-string credential values" do
+      expect { described_class.new({ "type" => "npm_registry", "token" => false }) }
+        .to raise_error(TypeError, "credential token must be a string or nil")
     end
   end
 end

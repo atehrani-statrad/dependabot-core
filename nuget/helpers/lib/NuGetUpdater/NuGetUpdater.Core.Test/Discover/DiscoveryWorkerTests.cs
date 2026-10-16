@@ -269,6 +269,7 @@ public partial class DiscoveryWorkerTests : DiscoveryWorkerTestBase
             expectedResult: new()
             {
                 Path = "src",
+                SolutionDirectory = "src",
                 Projects = [
                     new()
                     {
@@ -550,6 +551,7 @@ public partial class DiscoveryWorkerTests : DiscoveryWorkerTestBase
             expectedResult: new()
             {
                 Path = "",
+                SolutionDirectory = ".",
                 Projects = [
                     new()
                     {
@@ -816,6 +818,7 @@ public partial class DiscoveryWorkerTests : DiscoveryWorkerTestBase
             expectedResult: new()
             {
                 Path = "src",
+                SolutionDirectory = "src",
                 Projects = [
                     new()
                     {
@@ -831,6 +834,58 @@ public partial class DiscoveryWorkerTests : DiscoveryWorkerTestBase
                         FilePath = "server/server.csproj",
                         TargetFrameworks = ["net8.0"],
                         Dependencies = [new("Package.B", "4.5.6", DependencyType.PackageReference, TargetFrameworks: ["net8.0"])],
+                        ReferencedProjectPaths = [],
+                        ImportedFiles = [],
+                        AdditionalFiles = [],
+                    }
+                ]
+            }
+        );
+    }
+
+    [Fact]
+    public async Task TestRepo_SolutionDirectoryIsCapturedAndHonored()
+    {
+        // the workspace directly contains a solution file, so the `SolutionDir` MSBuild property is faked during
+        // discovery; the project only references the package when `$(SolutionDir)` is set, and the resolved solution
+        // directory is reported on the discovery result so it can be retrieved later
+        await TestDiscoveryAsync(
+            packages:
+            [
+                MockNuGetPackage.CreateSimplePackage("Solution.Scoped.Package", "9.0.1", "net8.0"),
+            ],
+            workspacePath: "",
+            files: new[]
+            {
+                ("project.csproj", """
+                    <Project Sdk="Microsoft.NET.Sdk">
+                      <PropertyGroup>
+                        <TargetFramework>net8.0</TargetFramework>
+                      </PropertyGroup>
+
+                      <ItemGroup Condition="Exists('$(SolutionDir)')">
+                        <PackageReference Include="Solution.Scoped.Package" Version="9.0.1" />
+                      </ItemGroup>
+                    </Project>
+                    """),
+                ("solution.slnx", """
+                    <Solution>
+                      <Project Path="project.csproj" />
+                    </Solution>
+                    """)
+            },
+            expectedResult: new()
+            {
+                Path = "",
+                SolutionDirectory = ".",
+                Projects = [
+                    new()
+                    {
+                        FilePath = "project.csproj",
+                        TargetFrameworks = ["net8.0"],
+                        Dependencies = [
+                            new("Solution.Scoped.Package", "9.0.1", DependencyType.PackageReference, TargetFrameworks: ["net8.0"])
+                        ],
                         ReferencedProjectPaths = [],
                         ImportedFiles = [],
                         AdditionalFiles = [],
@@ -874,6 +929,7 @@ public partial class DiscoveryWorkerTests : DiscoveryWorkerTestBase
             expectedResult: new()
             {
                 Path = "",
+                SolutionDirectory = ".",
                 Projects = [
                     new()
                     {
@@ -954,6 +1010,7 @@ public partial class DiscoveryWorkerTests : DiscoveryWorkerTestBase
             expectedResult: new()
             {
                 Path = "",
+                SolutionDirectory = ".",
                 Projects = [
                     new()
                     {
@@ -1037,6 +1094,7 @@ public partial class DiscoveryWorkerTests : DiscoveryWorkerTestBase
             expectedResult: new()
             {
                 Path = "",
+                SolutionDirectory = ".",
                 Projects = [
                     new()
                     {
@@ -1679,6 +1737,45 @@ public partial class DiscoveryWorkerTests : DiscoveryWorkerTestBase
     }
 
     [Fact]
+    public async Task ExpandEntryPoints_IgnoresSolutionFolders()
+    {
+        using var tempDir = await TemporaryDirectory.CreateWithContentsAsync(
+            ("solution.sln", """
+                Microsoft Visual Studio Solution File, Format Version 12.00
+                Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Project", "src\project.csproj", "{00000000-0000-0000-0000-000000000001}"
+                EndProject
+                Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = ".sln", ".sln", "{2730C57A-D6A7-4A4F-913A-AF211E54B717}"
+                    ProjectSection(SolutionItems) = preProject
+                        .editorconfig = .editorconfig
+                    EndProjectSection
+                EndProject
+                """),
+            ("src/project.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net9.0</TargetFramework>
+                  </PropertyGroup>
+                </Project>
+                """)
+        );
+        Directory.CreateDirectory(Path.Combine(tempDir.DirectoryPath, ".sln"));
+
+        var actualEntryPoints = (await DiscoveryWorker.ExpandEntryPointsIntoProjectsAsync(
+            [Path.Combine(tempDir.DirectoryPath, "solution.sln")],
+            new ExperimentsManager(),
+            new TestLogger(),
+            repoRootPath: tempDir.DirectoryPath))
+            .Select(p => p.NormalizePathToUnix())
+            .ToArray();
+        var expectedEntryPoints = new[]
+        {
+            Path.Combine(tempDir.DirectoryPath, "src/project.csproj").NormalizePathToUnix(),
+        };
+
+        AssertEx.Equal(expectedEntryPoints, actualEntryPoints);
+    }
+
+    [Fact]
     public async Task ExpandEntryPoints_FiltersProjectsInSubmodules()
     {
         using var tempDir = await TemporaryDirectory.CreateWithContentsAsync(
@@ -2088,6 +2185,7 @@ public partial class DiscoveryWorkerTests : DiscoveryWorkerTestBase
             expectedResult: new()
             {
                 Path = "",
+                SolutionDirectory = ".",
                 Projects = [
                     new()
                     {

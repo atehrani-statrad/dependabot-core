@@ -5,6 +5,7 @@ require "spec_helper"
 require "dependabot/swift/update_checker/xcode_version_resolver"
 require "dependabot/dependency"
 require "dependabot/git_commit_checker"
+require "dependabot/package/release_cooldown_options"
 require "dependabot/security_advisory"
 require "dependabot/swift/version"
 
@@ -45,12 +46,12 @@ RSpec.describe Dependabot::Swift::UpdateChecker::XcodeVersionResolver do
   end
 
   let(:latest_tag) do
-    {
+    Dependabot::GitTagDetails.new(
       tag: "7.0.2",
       version: Dependabot::Swift::Version.new("7.0.2"),
       commit_sha: "91132c0fe9a98e76f3d7381a608685aa41770706",
       tag_sha: "abc123"
-    }
+    )
   end
 
   describe "#latest_resolvable_version_tag" do
@@ -94,6 +95,24 @@ RSpec.describe Dependabot::Swift::UpdateChecker::XcodeVersionResolver do
 
     it "returns the version from the tag" do
       expect(resolver.latest_resolvable_version).to eq(Dependabot::Swift::Version.new("7.0.2"))
+    end
+
+    context "with update_cooldown" do
+      let(:cooldown) { Dependabot::Package::ReleaseCooldownOptions.new(semver_major_days: 90) }
+
+      let(:resolver) do
+        described_class.new(
+          dependency: dependency,
+          git_commit_checker: git_commit_checker,
+          security_advisories: security_advisories,
+          update_cooldown: cooldown
+        )
+      end
+
+      it "passes cooldown to local_tag_for_latest_version" do
+        resolver.latest_resolvable_version
+        expect(git_commit_checker).to have_received(:local_tag_for_latest_version).with(cooldown)
+      end
     end
   end
 
@@ -256,16 +275,28 @@ RSpec.describe Dependabot::Swift::UpdateChecker::XcodeVersionResolver do
 
     let(:all_tags) do
       [
-        { tag: "5.15.0", version: Dependabot::Swift::Version.new("5.15.0"), commit_sha: "aaa111" },
-        { tag: "5.18.0", version: Dependabot::Swift::Version.new("5.18.0"), commit_sha: "bbb222" },
-        { tag: "5.19.0", version: Dependabot::Swift::Version.new("5.19.0"), commit_sha: "ccc333" },
-        { tag: "5.20.0", version: Dependabot::Swift::Version.new("5.20.0"), commit_sha: "ddd444" },
-        { tag: "5.21.7", version: Dependabot::Swift::Version.new("5.21.7"), commit_sha: "eee555" }
+        Dependabot::GitTagDetails.new(
+          tag: "5.15.0", version: Dependabot::Swift::Version.new("5.15.0"), commit_sha: "aaa111"
+        ),
+        Dependabot::GitTagDetails.new(
+          tag: "5.18.0", version: Dependabot::Swift::Version.new("5.18.0"), commit_sha: "bbb222"
+        ),
+        Dependabot::GitTagDetails.new(
+          tag: "5.19.0", version: Dependabot::Swift::Version.new("5.19.0"), commit_sha: "ccc333"
+        ),
+        Dependabot::GitTagDetails.new(
+          tag: "5.20.0", version: Dependabot::Swift::Version.new("5.20.0"), commit_sha: "ddd444"
+        ),
+        Dependabot::GitTagDetails.new(
+          tag: "5.21.7", version: Dependabot::Swift::Version.new("5.21.7"), commit_sha: "eee555"
+        )
       ]
     end
 
     let(:latest_tag) do
-      { tag: "5.21.7", version: Dependabot::Swift::Version.new("5.21.7"), commit_sha: "eee555" }
+      Dependabot::GitTagDetails.new(
+        tag: "5.21.7", version: Dependabot::Swift::Version.new("5.21.7"), commit_sha: "eee555"
+      )
     end
 
     before do

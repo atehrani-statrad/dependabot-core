@@ -414,8 +414,8 @@ module Dependabot
         sig { returns(T.nilable(String)) }
         def registry_source_url # rubocop:disable Metrics/PerceivedComplexity
           sources = dependency&.requirements
-                              &.map { |r| r.fetch(:source) }&.uniq&.compact
-                              &.sort_by { |source| self.class.central_registry?(source[:url]) ? 1 : 0 }
+                              &.map(&:source_hash)&.uniq&.compact
+                              &.sort_by { |source| self.class.central_registry?(T.cast(source[:url], String)) ? 1 : 0 }
 
           sources&.find { |s| s[:type] == "registry" }
                  &.fetch(:url)
@@ -428,8 +428,8 @@ module Dependabot
           return unless yarnrc_yml_file_content
           return @parsed_yarnrc_yml if @parsed_yarnrc_yml
 
-          @parsed_yarnrc_yml = YAML.safe_load(yarnrc_yml_file_content)
-          @parsed_yarnrc_yml
+          parsed = YAML.safe_load(yarnrc_yml_file_content)
+          @parsed_yarnrc_yml = parsed.is_a?(Hash) ? parsed : nil
         end
 
         sig { params(url: String).returns(String) }
