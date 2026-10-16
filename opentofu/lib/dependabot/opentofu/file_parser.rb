@@ -35,13 +35,10 @@ module Dependabot
       # binary. Providers in these namespaces cannot be updated independently
       # because their version tracks the binary itself.
       # See: https://pkg.go.dev/github.com/opentofu/registry-address/v2#Provider.IsBuiltIn
-      BUILTIN_PROVIDER_NAMESPACES = T.let(
-        %w(
-          terraform.io/builtin
-          opentofu.org/builtin
-        ).freeze,
-        T::Array[String]
-      )
+      BUILTIN_PROVIDER_NAMESPACES = %w(
+        terraform.io/builtin
+        opentofu.org/builtin
+      ).freeze
 
       sig { override.returns(T::Array[Dependabot::Dependency]) }
       def parse
@@ -170,8 +167,16 @@ module Dependabot
             next unless details["source"]
 
             source = source_from(details)
-            # Cannot update nil (interpolation sources) or local path modules, skip
+            # nil sources are unpinned; paths are local.
             next if source.nil? || source[:type] == "path"
+
+            # Cannot update modules using early evaluation yet
+            if source[:type] == "interpolation"
+              Dependabot.logger.warn(
+                "Cannot parse terragrunt module source with early evaluation in #{file.name}."
+              )
+              next
+            end
 
             dependency_set << build_terragrunt_dependency(file, source)
           end
@@ -346,11 +351,11 @@ module Dependabot
         # sub-module path; only the bare repo is queryable for tags.
         artifact_identifier, subdirectory = uri_part.split(%r{(?<!:)//}, 2)
 
-        qs = CGI.parse(query_part)
+        qs = URI.decode_www_form(query_part).to_h
         # Treat `?tag=` or `?digest=` (empty value) the same as the param
         # being absent, so we don't propagate "" as a usable version.
-        tag = qs["tag"].first&.then { |v| v.empty? ? nil : v }
-        digest = qs["digest"].first&.then { |v| v.empty? ? nil : v }
+        tag = qs["tag"]&.then { |v| v.empty? ? nil : v }
+        digest = qs["digest"]&.then { |v| v.empty? ? nil : v }
 
         if tag && digest
           raise DependencyFileNotEvaluatable,
@@ -440,8 +445,8 @@ module Dependabot
       # rubocop:disable Metrics/CyclomaticComplexity
       sig { params(source_string: String).returns(Symbol) }
       def source_type(source_string)
-        return :oci if source_string.include?("oci://")
         return :interpolation if source_string.include?("${")
+        return :oci if source_string.include?("oci://")
         return :path if source_string.start_with?(".")
         return :github if source_string.start_with?("github.com/")
         return :bitbucket if source_string.start_with?("bitbucket.org/")

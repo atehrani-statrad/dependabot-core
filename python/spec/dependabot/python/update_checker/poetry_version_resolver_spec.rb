@@ -1,4 +1,5 @@
 # typed: false
+# Sorbet cannot resolve the dynamic class and child-context response fixture. https://srb.help/7003
 # frozen_string_literal: true
 
 require "spec_helper"
@@ -685,7 +686,7 @@ RSpec.describe namespace::PoetryVersionResolver do
           "Resolving dependencies..." \
           "Incompatible constraints in requirements of reflector (0.1.0):" \
           "types-setuptools (==75.8.0.20250210)" \
-          "types-setuptools (>=69.1.0.20240308,<70.0.0.0)" \
+          "types-setuptools (>=69.1.0.20240308,<70.0.0.0)"
       end
 
       it "raises a helpful error" do

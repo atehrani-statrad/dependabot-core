@@ -1,4 +1,5 @@
 # typed: false
+# Sorbet cannot resolve parameterized its examples. https://srb.help/7003
 # frozen_string_literal: true
 
 require "spec_helper"
@@ -17,7 +18,11 @@ RSpec.describe Dependabot::Uv::UpdateChecker::RequirementsUpdater do
   end
 
   let(:update_strategy) { Dependabot::RequirementsUpdateStrategy::BumpVersions }
-  let(:requirements) { [requirement_txt_req, setup_py_req, setup_cfg_req].compact }
+  let(:requirements) do
+    [requirement_txt_req, setup_py_req, setup_cfg_req]
+      .compact
+      .map { |requirement| Dependabot::DependencyRequirement.create(requirement) }
+  end
   let(:requirement_txt_req) do
     {
       file: "requirements.txt",

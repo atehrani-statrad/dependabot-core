@@ -113,6 +113,15 @@ RSpec.describe Dependabot::Nix::FileParser do
       end
     end
 
+    context "with a commit-pinned (bare SHA) input that should be skipped" do
+      let(:flake_lock_content) { fixture("flake_with_rev_pinned.lock") }
+
+      it "skips inputs pinned to an immutable revision" do
+        expect(dependencies.length).to eq(1)
+        expect(dependencies.first.name).to eq("nixpkgs")
+      end
+    end
+
     context "with gitlab inputs" do
       let(:flake_lock_content) { fixture("flake_with_gitlab.lock") }
 
@@ -120,6 +129,47 @@ RSpec.describe Dependabot::Nix::FileParser do
         gitlab_dep = dependencies.find { |d| d.name == "my-gitlab-dep" }
         expect(gitlab_dep.requirements.first[:source][:url])
           .to eq("https://gitlab.com/myorg/myrepo")
+      end
+    end
+
+    context "with a SourceHut input" do
+      let(:flake_lock_content) do
+        <<~JSON
+          {
+            "nodes": {
+              "sourcehut-dep": {
+                "locked": {
+                  "lastModified": 1654847660,
+                  "narHash": "sha256-Mjdh3ackWoxkNBIcfXyqPlAc4mNe0EtZvb1cmgcyd+I=",
+                  "owner": "~user",
+                  "repo": "myrepo",
+                  "rev": "old_sha_abc123",
+                  "type": "sourcehut"
+                },
+                "original": {
+                  "owner": "~user",
+                  "ref": "main",
+                  "repo": "myrepo",
+                  "type": "sourcehut"
+                }
+              },
+              "root": {
+                "inputs": {
+                  "sourcehut-dep": "sourcehut-dep"
+                }
+              }
+            },
+            "root": "root",
+            "version": 7
+          }
+        JSON
+      end
+
+      it "uses the owner from the lockfile" do
+        dependency = dependencies.find { |item| item.name == "sourcehut-dep" }
+
+        expect(dependency.requirements.first[:source][:url])
+          .to eq("https://git.sr.ht/~user/myrepo")
       end
     end
 
@@ -139,6 +189,67 @@ RSpec.describe Dependabot::Nix::FileParser do
       end
     end
 
+    context "with a root input that follows a nested input path" do
+      let(:flake_lock_content) do
+        <<~JSON
+          {
+            "nodes": {
+              "parent-node": {
+                "inputs": {
+                  "nested": "target-node"
+                },
+                "locked": {
+                  "rev": "parent-revision",
+                  "type": "github",
+                  "owner": "example",
+                  "repo": "parent"
+                },
+                "original": {
+                  "type": "github",
+                  "owner": "example",
+                  "repo": "parent"
+                }
+              },
+              "target-node": {
+                "locked": {
+                  "rev": "target-revision",
+                  "type": "gitlab",
+                  "owner": "example",
+                  "repo": "target"
+                },
+                "original": {
+                  "type": "gitlab",
+                  "owner": "example",
+                  "repo": "target",
+                  "ref": "main"
+                }
+              },
+              "root": {
+                "inputs": {
+                  "alias": ["parent", "nested"],
+                  "parent": "parent-node"
+                }
+              }
+            },
+            "root": "root",
+            "version": 7
+          }
+        JSON
+      end
+
+      it "parses the followed node as the root dependency" do
+        dependency = dependencies.find { |item| item.name == "alias" }
+
+        expect(dependency.version).to eq("target-revision")
+        expect(dependency.requirements.first[:source])
+          .to include(
+            type: "git",
+            url: "https://gitlab.com/example/target",
+            ref: "main"
+          )
+      end
+    end
+
     context "with a custom host (self-hosted GitHub Enterprise)" do
       let(:flake_lock_content) { fixture("flake_with_custom_host.lock") }
 
@@ -146,6 +257,70 @@ RSpec.describe Dependabot::Nix::FileParser do
         dep = dependencies.find { |d| d.name == "internal-lib" }
         expect(dep.requirements.first[:source][:url])
           .to eq("https://github.corp.example.com/myteam/internal-lib")
+      end
+    end
+
+    context "with a NixOS channel tarball input" do
+      let(:flake_lock_content) { fixture("flake_with_tarball.lock") }
+
+      it "parses the tarball channel input" do
+        nixpkgs = dependencies.find { |d| d.name == "nixpkgs" }
+        expect(nixpkgs).to be_a(Dependabot::Dependency)
+        expect(nixpkgs.version).to eq("bd0ff2d3eac24699c3664d5966b9ef36f388e2ca")
+        expect(nixpkgs.requirements).to eq(
+          [{
+            requirement: nil,
+            file: "flake.lock",
+            source: {
+              type: "tarball",
+              url: "https://channels.nixos.org/nixos-26.05/nixexprs.tar.xz",
+              branch: nil,
+              ref: "nixos-26.05"
+            },
+            groups: []
+          }]
+        )
+      end
+
+      it "still parses git-backed inputs alongside it" do
+        expect(dependencies.map(&:name)).to contain_exactly("nixpkgs", "flake-utils")
+        flake_utils = dependencies.find { |d| d.name == "flake-utils" }
+        expect(flake_utils.requirements.first[:source][:type]).to eq("git")
+      end
+    end
+
+    context "with a non-NixOS tarball input" do
+      let(:flake_lock_content) do
+        <<~JSON
+          {
+            "nodes": {
+              "some-tarball": {
+                "locked": {
+                  "lastModified": 1700000000,
+                  "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                  "rev": "1111111111111111111111111111111111111111",
+                  "type": "tarball",
+                  "url": "https://example.com/archive/v1.0.0.tar.gz"
+                },
+                "original": {
+                  "type": "tarball",
+                  "url": "https://example.com/archive/v1.0.0.tar.gz"
+                }
+              },
+              "root": {
+                "inputs": {
+                  "some-tarball": "some-tarball"
+                }
+              }
+            },
+            "root": "root",
+            "version": 7
+          }
+        JSON
+      end
+
+      it "skips tarball inputs that are not NixOS channels" do
+        expect(dependencies).to be_empty
       end
     end
   end

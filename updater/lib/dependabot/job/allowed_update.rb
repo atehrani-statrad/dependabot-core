@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
@@ -7,9 +7,9 @@ module Dependabot
   class Job
     # Parsed representation of an allowed update rule from the job definition.
     #
-    # Replaces the raw T::Hash[String, T.untyped] with a typed struct so
+    # Replaces the raw job hash with a typed struct so
     # downstream code gets compile-time checked field access instead of
-    # hash key lookups that return T.untyped.
+    # raw hash key lookups.
     class AllowedUpdate < T::ImmutableStruct
       extend T::Sig
 
@@ -19,29 +19,52 @@ module Dependabot
       const :update_types, T::Array[String], default: []
       const :prerelease, T.nilable(T::Boolean), default: nil
 
-      sig { params(hash: T::Hash[String, T.untyped]).returns(AllowedUpdate) }
+      sig { params(hash: T::Hash[String, Object]).returns(AllowedUpdate) }
       def self.from_hash(hash)
         new(
-          dependency_name: hash["dependency-name"],
-          dependency_type: hash.fetch("dependency-type", "all") || "all",
-          update_type: hash.fetch("update-type", "all") || "all",
-          update_types: hash.fetch("update-types", []) || [],
-          prerelease: hash["prerelease"]
+          dependency_name: optional_string(hash["dependency-name"], "dependency-name"),
+          dependency_type: string_with_default(hash["dependency-type"], "dependency-type", "all"),
+          update_type: string_with_default(hash["update-type"], "update-type", "all"),
+          update_types: string_array_with_default(hash["update-types"], "update-types"),
+          prerelease: optional_boolean(hash["prerelease"], "prerelease")
         )
       end
 
-      # Temporary bridge: returns the original hash format for code that
-      # still expects hash access. Remove once all callers are migrated.
-      sig { returns(T::Hash[String, T.untyped]) }
-      def to_hash
-        h = T.let({}, T::Hash[String, T.untyped])
-        h["dependency-name"] = dependency_name if dependency_name
-        h["dependency-type"] = dependency_type
-        h["update-type"] = update_type
-        h["update-types"] = update_types unless update_types.empty?
-        h["prerelease"] = prerelease unless prerelease.nil?
-        h
+      sig { params(value: T.nilable(Object), key: String).returns(T.nilable(String)) }
+      def self.optional_string(value, key)
+        return if value.nil?
+        raise TypeError, "#{key} must be a string" unless value.is_a?(String)
+
+        value
       end
+      private_class_method :optional_string
+
+      sig { params(value: T.nilable(Object), key: String, default: String).returns(String) }
+      def self.string_with_default(value, key, default)
+        return default if value.nil?
+        raise TypeError, "#{key} must be a string" unless value.is_a?(String)
+
+        value
+      end
+      private_class_method :string_with_default
+
+      sig { params(value: T.nilable(Object), key: String).returns(T::Array[String]) }
+      def self.string_array_with_default(value, key)
+        return [] if value.nil?
+        raise TypeError, "#{key} must be an array of strings" unless value.is_a?(Array) && value.all?(String)
+
+        value.map { |entry| T.cast(entry, String) }
+      end
+      private_class_method :string_array_with_default
+
+      sig { params(value: T.nilable(Object), key: String).returns(T.nilable(T::Boolean)) }
+      def self.optional_boolean(value, key)
+        return if value.nil?
+        raise TypeError, "#{key} must be a boolean" unless value.is_a?(TrueClass) || value.is_a?(FalseClass)
+
+        value
+      end
+      private_class_method :optional_boolean
     end
   end
 end

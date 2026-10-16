@@ -3,6 +3,7 @@
 
 require "toml-rb"
 require "open3"
+require "uri"
 require "dependabot/dependency"
 require "dependabot/shared_helpers"
 require "dependabot/uv/language_version_manager"
@@ -17,7 +18,7 @@ require "dependabot/uv/requirement_suffix_helper"
 module Dependabot
   module Uv
     class FileUpdater
-      # rubocop:disable Metrics/ClassLength
+      # rubocop:disable-next Metrics/ClassLength
       class LockFileUpdater
         extend T::Sig
 
@@ -43,21 +44,33 @@ module Dependabot
         sig { returns(T.nilable(String)) }
         attr_reader :repo_contents_path
 
+        sig { returns(T.nilable(String)) }
+        attr_reader :target_requirement
+
         sig do
           params(
             dependencies: T::Array[Dependency],
             dependency_files: T::Array[DependencyFile],
             credentials: T::Array[Dependabot::Credential],
             index_urls: T.nilable(T::Array[T.nilable(String)]),
-            repo_contents_path: T.nilable(String)
+            repo_contents_path: T.nilable(String),
+            target_requirement: T.nilable(String)
           ).void
         end
-        def initialize(dependencies:, dependency_files:, credentials:, index_urls: nil, repo_contents_path: nil)
+        def initialize(
+          dependencies:,
+          dependency_files:,
+          credentials:,
+          index_urls: nil,
+          repo_contents_path: nil,
+          target_requirement: nil
+        )
           @dependencies = dependencies
           @dependency_files = dependency_files
           @credentials = credentials
           @index_urls = index_urls
           @repo_contents_path = repo_contents_path
+          @target_requirement = target_requirement
           @prepared_pyproject = T.let(nil, T.nilable(String))
           @updated_lockfile_content = T.let(nil, T.nilable(String))
           @pyproject = T.let(nil, T.nilable(Dependabot::DependencyFile))
@@ -83,7 +96,7 @@ module Dependabot
         def build_system_only_dependency?
           return false unless dependency
 
-          groups = T.must(dependency).requirements.flat_map { |req| req[:groups] || [] }.compact.uniq
+          groups = T.must(dependency).requirements.flat_map { |req| req.groups || [] }.compact.uniq
           return false if groups.empty?
 
           groups.all?("build-system")
@@ -96,17 +109,24 @@ module Dependabot
           updated_files = pyproject_files.filter_map do |file|
             next unless file_changed?(file)
 
-            updated_file(
+            updated = updated_file(
               file: file,
               content: T.must(updated_pyproject_content_for(file))
             )
+            # support_file must be false to prevent DependencyChangeBuilder from discarding the inner TOML,
+            # since doing so causes a conflict between the updated lock file and the committed TOML
+            # and breaks `uv sync --locked` in CI.
+            updated.support_file = false
+            updated
           end
 
           if lockfile && !build_system_only_dependency?
             # Use updated_lockfile_content which might raise if the lockfile doesn't change
             new_content = updated_lockfile_content
 
-            raise "Expected lockfile to change!" if T.must(lockfile).content == new_content
+            if T.must(lockfile).content == new_content
+              raise DependencyFileContentNotChanged, "Expected lockfile to change!"
+            end
 
             updated_files << updated_file(file: T.must(lockfile), content: new_content)
           end
@@ -127,7 +147,7 @@ module Dependabot
           updated_content = content.dup
 
           T.must(dependency).requirements.zip(T.must(T.must(dependency).previous_requirements)).each do |new_r, old_r|
-            next unless new_r[:file] == file.name && T.must(old_r)[:file] == file.name
+            next unless new_r.file == file.name && T.must(old_r).file == file.name
 
             updated_content = replace_dep(T.must(dependency), updated_content, new_r, T.must(old_r))
           end
@@ -141,13 +161,13 @@ module Dependabot
           params(
             dep: Dependabot::Dependency,
             content: String,
-            new_r: T::Hash[Symbol, T.untyped],
-            old_r: T::Hash[Symbol, T.untyped]
+            new_r: Dependabot::DependencyRequirement,
+            old_r: Dependabot::DependencyRequirement
           ).returns(String)
         end
         def replace_dep(dep, content, new_r, old_r)
-          new_req = new_r[:requirement]
-          old_req = old_r[:requirement]
+          new_req = new_r.requirement_string
+          old_req = old_r.requirement_string
           escaped_name = escape_package_name(dep.name)
 
           regex = /(["']#{escaped_name})([^"']+)(["'])/x
@@ -285,7 +305,14 @@ module Dependabot
           # Strip extras from the package name for the uv lock command
           # uv lock --upgrade-package expects the base package name without extras
           base_dep_name = normalise(dep_name)
-          package_spec = dep_version ? "#{base_dep_name}==#{dep_version}" : base_dep_name
+          package_spec =
+            if target_requirement
+              "#{base_dep_name}#{target_requirement}"
+            elsif dep_version
+              "#{base_dep_name}==#{dep_version}"
+            else
+              base_dep_name
+            end
 
           command = "pyenv exec uv lock --upgrade-package #{package_spec} #{options}"
           fingerprint = "pyenv exec uv lock --upgrade-package <dependency_name> #{options_fingerprint}"
@@ -365,14 +392,52 @@ module Dependabot
 
         sig { returns(T::Array[String]) }
         def lock_index_options
-          filtered_credentials = credentials
-                                 .select { |cred| cred["type"] == "python_index" }
-                                 .reject do |cred|
-                                   cred.replaces_base? ? defined_in_pyproject?(cred) : explicit_index?(cred)
-                                 end
-
+          filtered_credentials = filtered_python_index_credentials
           options = T.let([], T::Array[String])
           used_credential_urls = T.let([], T::Array[String])
+          default_index_used = T.let(false, T::Boolean)
+
+          default_index_used = add_lockfile_registry_options(
+            filtered_credentials: filtered_credentials,
+            options: options,
+            used_credential_urls: used_credential_urls,
+            default_index_used: default_index_used
+          )
+
+          add_fallback_index_options(
+            filtered_credentials: filtered_credentials,
+            options: options,
+            used_credential_urls: used_credential_urls,
+            default_index_used: default_index_used
+          )
+
+          options.uniq
+        end
+
+        sig { returns(T::Array[Dependabot::Credential]) }
+        def filtered_python_index_credentials
+          credentials
+            .select { |cred| cred["type"] == "python_index" }
+            .reject { |cred| skip_lock_index_credential?(cred) }
+        end
+
+        # Skip credentials whose index is already declared in pyproject.toml; those are
+        # authenticated via UV_INDEX_<NAME>_* env vars (see #pyproject_index_env_vars) so uv
+        # uses the pyproject.toml index entry directly, avoiding a duplicate --index flag.
+        sig { params(credential: Dependabot::Credential).returns(T::Boolean) }
+        def skip_lock_index_credential?(credential)
+          defined_in_pyproject?(credential)
+        end
+
+        sig do
+          params(
+            filtered_credentials: T::Array[Dependabot::Credential],
+            options: T::Array[String],
+            used_credential_urls: T::Array[String],
+            default_index_used: T::Boolean
+          ).returns(T::Boolean)
+        end
+        def add_lockfile_registry_options(filtered_credentials:, options:, used_credential_urls:, default_index_used:)
           credential_matcher = LockIndexCredentialMatcher.new(credentials: filtered_credentials)
 
           uv_lock_registry_urls.each do |registry_url|
@@ -380,23 +445,59 @@ module Dependabot
             next unless credential
 
             used_credential_urls << credential["index-url"].to_s
-            options << option_for_credential_url(credential, authed_registry_url(credential, registry_url))
+            default_index_used = add_lock_index_option(
+              credential: credential,
+              url: authed_registry_url(credential, registry_url),
+              options: options,
+              default_index_used: default_index_used
+            )
           end
 
+          default_index_used
+        end
+
+        sig do
+          params(
+            filtered_credentials: T::Array[Dependabot::Credential],
+            options: T::Array[String],
+            used_credential_urls: T::Array[String],
+            default_index_used: T::Boolean
+          ).returns(T::Boolean)
+        end
+        def add_fallback_index_options(filtered_credentials:, options:, used_credential_urls:, default_index_used:)
           # Fall back to credential URLs for indices not represented in uv.lock.
           filtered_credentials.each do |credential|
             next if used_credential_urls.include?(credential["index-url"].to_s)
 
-            authed_url = AuthedUrlBuilder.authed_url(credential: credential)
-            options << option_for_credential_url(credential, authed_url)
+            default_index_used = add_lock_index_option(
+              credential: credential,
+              url: AuthedUrlBuilder.authed_url(credential: credential),
+              options: options,
+              default_index_used: default_index_used
+            )
           end
 
-          options.uniq
+          default_index_used
         end
 
-        sig { params(credential: Dependabot::Credential, url: String).returns(String) }
-        def option_for_credential_url(credential, url)
-          if credential.replaces_base?
+        sig do
+          params(
+            credential: Dependabot::Credential,
+            url: String,
+            options: T::Array[String],
+            default_index_used: T::Boolean
+          ).returns(T::Boolean)
+        end
+        def add_lock_index_option(credential:, url:, options:, default_index_used:)
+          options << option_for_credential_url(credential, url, default_index_used: default_index_used)
+          default_index_used || credential.replaces_base?
+        end
+
+        sig do
+          params(credential: Dependabot::Credential, url: String, default_index_used: T::Boolean).returns(String)
+        end
+        def option_for_credential_url(credential, url, default_index_used:)
+          if credential.replaces_base? && !default_index_used
             "--default-index #{url}"
           else
             "--index #{url}"
@@ -428,16 +529,6 @@ module Dependabot
           []
         end
 
-        sig { params(credential: Dependabot::Credential).returns(T::Boolean) }
-        def explicit_index?(credential)
-          return false if credential.replaces_base?
-
-          cred_url = normalize_index_url(credential["index-url"].to_s)
-          uv_indices.any? do |_name, config|
-            config["explicit"] == true && normalize_index_url(config["url"].to_s) == cred_url
-          end
-        end
-
         # Checks if a credential's index URL matches any index defined in pyproject.toml.
         # When true, authentication is provided via env vars so uv uses the pyproject.toml URL,
         # preserving URL format alignment between pyproject.toml and uv.lock.
@@ -446,8 +537,15 @@ module Dependabot
           !find_index_name_for_credential(credential).nil?
         end
 
+        # Strips trailing slashes and any embedded userinfo so a pyproject.toml URL like
+        # https://oauth2accesstoken@host/path matches a credential URL like https://host/path.
         sig { params(url: String).returns(String) }
         def normalize_index_url(url)
+          uri = URI.parse(url.chomp("/"))
+          uri.user = nil
+          uri.password = nil
+          uri.to_s
+        rescue URI::InvalidURIError
           url.chomp("/")
         end
 
@@ -469,8 +567,7 @@ module Dependabot
             next unless name
 
             result[name] = {
-              "url" => index["url"],
-              "explicit" => index["explicit"] == true
+              "url" => index["url"]
             }
           end
         rescue TomlRB::ParseError
@@ -558,7 +655,7 @@ module Dependabot
           return false unless file
 
           dependencies.any? do |dep|
-            dep.requirements.any? { |r| r[:file] == file.name } &&
+            dep.requirements.any? { |r| r.file == file.name } &&
               requirement_changed?(file, dep)
           end
         end
@@ -571,7 +668,7 @@ module Dependabot
           changed_requirements =
             dependency.requirements - T.must(dependency.previous_requirements)
 
-          changed_requirements.any? { |f| f[:file] == T.must(file).name }
+          changed_requirements.any? { |f| f.file == T.must(file).name }
         end
 
         sig { params(file: Dependabot::DependencyFile, content: String).returns(Dependabot::DependencyFile) }
@@ -643,7 +740,7 @@ module Dependabot
         def create_or_update_lock_file?
           return true if lockfile && T.must(dependency).requirements.empty?
 
-          T.must(dependency).requirements.select { _1[:file].end_with?(*REQUIRED_FILES) }.any?
+          T.must(dependency).requirements.any? { |req| req.file&.end_with?(*REQUIRED_FILES) }
         end
 
         sig { returns(T::Hash[String, String]) }
@@ -701,7 +798,6 @@ module Dependabot
           )
         end
       end
-      # rubocop:enable Metrics/ClassLength
     end
   end
 end

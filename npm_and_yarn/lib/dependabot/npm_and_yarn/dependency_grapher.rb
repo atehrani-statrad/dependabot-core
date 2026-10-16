@@ -38,7 +38,7 @@ module Dependabot
         prepare! unless prepared
 
         @dependencies.each_with_object({}) do |dep, resolved|
-          all_versions = dep.metadata[:all_versions] || [dep]
+          all_versions = dep.metadata_dependencies(:all_versions) || [dep]
 
           all_versions.each do |version_dep|
             purl = build_purl(version_dep)
@@ -59,6 +59,14 @@ module Dependabot
         # Enable alias extraction for graph jobs so aliased packages appear
         # in the dependency graph for security scanning.
         file_parser.dealias_packages!
+
+        # Graph jobs never call `FileParser#parse` through `#ecosystem` (unlike
+        # update/security jobs), so without this the npm engine constraint for
+        # this directory would never be set up, and the thread-local npm
+        # version selector would still hold whichever directory ran last (or
+        # none at all). Force it here, before any npm command can run (namely
+        # ephemeral lockfile generation below), so the right npm is active.
+        file_parser.ecosystem
 
         if lockfile.nil?
           Dependabot.logger.info("No lockfile found, generating ephemeral lockfile for dependency graphing")
@@ -125,7 +133,7 @@ module Dependabot
         @detected_package_manager ||= T.let(
           PackageManagerDetector.new(
             lockfiles_hash,
-            parsed_package_json
+            Dependabot::Package::NpmPackageManagerConfig.from_package_json(parsed_package_json)
           ).detect_package_manager,
           T.nilable(String)
         )

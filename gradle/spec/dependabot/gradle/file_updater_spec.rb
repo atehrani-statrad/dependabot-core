@@ -1,4 +1,5 @@
 # typed: false
+# Sorbet cannot resolve generated examples and dynamic subclass constants. https://srb.help/7003
 # frozen_string_literal: true
 
 require "spec_helper"
@@ -70,12 +71,6 @@ RSpec.describe Dependabot::Gradle::FileUpdater do
       allow(Dependabot::SharedHelpers).to receive(:run_shell_command) do |command, _|
         raise "Unexpected shell command: #{command}"
       end
-
-      Dependabot::Experiments.register(:gradle_lockfile_updater, true)
-    end
-
-    after do
-      Dependabot::Experiments.reset!
     end
 
     it "returns DependencyFile objects" do
@@ -252,6 +247,78 @@ RSpec.describe Dependabot::Gradle::FileUpdater do
               'kotlin("jvm") version "1.4.21-2"'
             )
           end
+        end
+      end
+
+      context "with a dependencySubstitution block sharing a coordinate" do
+        let(:buildfile_fixture_name) { "dependency_substitution.gradle" }
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "io.airlift:aircompressor",
+            version: "2.0.4",
+            requirements: [{
+              file: "build.gradle",
+              requirement: "2.0.4",
+              groups: [],
+              source: nil,
+              metadata: nil
+            }],
+            previous_requirements: [{
+              file: "build.gradle",
+              requirement: "2.0.2",
+              groups: [],
+              source: nil,
+              metadata: nil
+            }],
+            package_manager: "gradle"
+          )
+        end
+
+        it "updates the real dependency but leaves the substitution rule untouched" do
+          expect(updated_buildfile.content).to include(
+            "implementation group: 'io.airlift', name: 'aircompressor', version: '2.0.4'"
+          )
+          expect(updated_buildfile.content).to include(
+            'substitute module("io.airlift:aircompressor:2.0.2") using ' \
+            'module("io.airlift:aircompressor:2.0.3")'
+          )
+        end
+      end
+
+      context "with a multiline dependencySubstitution rule sharing a coordinate" do
+        let(:buildfile_fixture_name) { "dependency_substitution.gradle" }
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "com.google.guava:guava",
+            version: "32.0-jre",
+            requirements: [{
+              file: "build.gradle",
+              requirement: "32.0-jre",
+              groups: [],
+              source: nil,
+              metadata: nil
+            }],
+            previous_requirements: [{
+              file: "build.gradle",
+              requirement: "30.0-jre",
+              groups: [],
+              source: nil,
+              metadata: nil
+            }],
+            package_manager: "gradle"
+          )
+        end
+
+        it "updates the real dependency but leaves the multiline substitution rule untouched" do
+          expect(updated_buildfile.content).to include(
+            "implementation group: 'com.google.guava', name: 'guava', version: '32.0-jre'"
+          )
+          expect(updated_buildfile.content).to include(
+            'substitute(module("com.google.guava:guava:30.0-jre"))'
+          )
+          expect(updated_buildfile.content).to include(
+            '.using(module("com.google.guava:guava:31.0-jre"))'
+          )
         end
       end
 
@@ -538,6 +605,13 @@ RSpec.describe Dependabot::Gradle::FileUpdater do
 
       context "with a dependency from a dependency set" do
         let(:buildfile_fixture_name) { "dependency_set.gradle" }
+        let(:buildfile_name) { "build.gradle" }
+        let(:buildfile) do
+          Dependabot::DependencyFile.new(
+            name: buildfile_name,
+            content: fixture("buildfiles", buildfile_fixture_name)
+          )
+        end
         let(:dependencies) do
           %w(
             com.google.protobuf:protoc
@@ -549,7 +623,7 @@ RSpec.describe Dependabot::Gradle::FileUpdater do
               version: "23.6-jre",
               previous_version: "3.6.1",
               requirements: [{
-                file: "build.gradle",
+                file: buildfile_name,
                 requirement: "23.6-jre",
                 groups: [],
                 source: {
@@ -564,7 +638,7 @@ RSpec.describe Dependabot::Gradle::FileUpdater do
                 }
               }],
               previous_requirements: [{
-                file: "build.gradle",
+                file: buildfile_name,
                 requirement: "3.6.1",
                 groups: [],
                 source: nil,
@@ -588,6 +662,75 @@ RSpec.describe Dependabot::Gradle::FileUpdater do
             )
           expect(updated_files.first.content)
             .to include("dependency 'org.apache.kafka:kafka-clients:3.6.1'")
+        end
+
+        context "with a Kotlin DSL build file" do
+          let(:buildfile_fixture_name) { "dependency_set.gradle.kts" }
+          let(:buildfile_name) { "build.gradle.kts" }
+
+          it "updates the version in the dependency set declaration" do
+            expect(updated_files.map(&:name)).to eq(["build.gradle.kts"])
+            expect(updated_files.first.content)
+              .to include('dependencySet("com.google.protobuf:23.6-jre") {')
+            expect(updated_files.first.content)
+              .to include('dependency("org.apache.kafka:kafka-clients:3.6.1")')
+          end
+        end
+      end
+
+      context "with a dependency from a Kotlin DSL dependency set whose version is a property" do
+        let(:buildfile) do
+          Dependabot::DependencyFile.new(
+            name: "build.gradle.kts",
+            content: fixture("buildfiles", "dependency_set.gradle.kts")
+          )
+        end
+        let(:dependencies) do
+          %w(
+            org.slf4j:slf4j-api
+            org.slf4j:slf4j-simple
+          ).map do |dep_name|
+            Dependabot::Dependency.new(
+              name: dep_name,
+              version: "2.0.7",
+              previous_version: "1.7.25",
+              requirements: [{
+                file: "build.gradle.kts",
+                requirement: "2.0.7",
+                groups: [],
+                source: nil,
+                metadata: {
+                  property_name: "slf4jVersion",
+                  dependency_set: {
+                    group: "org.slf4j",
+                    version: "$slf4jVersion"
+                  }
+                }
+              }],
+              previous_requirements: [{
+                file: "build.gradle.kts",
+                requirement: "1.7.25",
+                groups: [],
+                source: nil,
+                metadata: {
+                  property_name: "slf4jVersion",
+                  dependency_set: {
+                    group: "org.slf4j",
+                    version: "$slf4jVersion"
+                  }
+                }
+              }],
+              package_manager: "gradle"
+            )
+          end
+        end
+
+        it "updates the property rather than the dependency set declaration" do
+          expect(updated_files.map(&:name)).to eq(["build.gradle.kts"])
+          expect(updated_files.first.content).to include('val slf4jVersion = "2.0.7"')
+          expect(updated_files.first.content)
+            .to include('dependencySet("org.slf4j:$slf4jVersion") {')
+          expect(updated_files.first.content).to include('extra["nettyVersion"] = "4.1.30.Final"')
         end
       end
     end
@@ -735,6 +878,13 @@ RSpec.describe Dependabot::Gradle::FileUpdater do
 
             is_expected.to include("distributionUrl=#{distribution_url}")
 
+            # Regression guard for #15312: user-customized and structural keys must survive the
+            # wrapper update rather than being reset to Gradle's hardcoded defaults.
+            is_expected.to include("networkTimeout=10000")
+            is_expected.to include("validateDistributionUrl=true")
+            is_expected.to include("distributionBase=GRADLE_USER_HOME")
+            is_expected.to include("zipStoreBase=GRADLE_USER_HOME")
+
             if checksum
               expected_command += " --gradle-distribution-sha256-sum #{updated_checksum}"
               is_expected.to include("distributionSha256Sum=#{updated_checksum}")
@@ -802,6 +952,61 @@ RSpec.describe Dependabot::Gradle::FileUpdater do
           is_expected.to include(
             'kotlinter = { id = "org.jmailen.kotlinter", version = "3.12.0" }'
           )
+        end
+      end
+
+      context "when a version catalog dependency has a lockfile" do
+        let(:buildfile) do
+          Dependabot::DependencyFile.new(
+            name: "gradle/libs.versions.toml",
+            content: fixture("version_catalog_file", "libs.versions.toml")
+          )
+        end
+        let(:lockfile) do
+          Dependabot::DependencyFile.new(
+            name: "gradle.lockfile",
+            content: "androidx.core:core-ktx:1.7.0=compileClasspath\nempty=\n"
+          )
+        end
+        let(:dependency_files) { [buildfile, lockfile] }
+        let(:dependency) do
+          Dependabot::Dependency.new(
+            name: "androidx.core:core-ktx",
+            version: "1.8.0",
+            previous_version: "1.7.0",
+            requirements: [{
+              file: "gradle/libs.versions.toml",
+              requirement: "1.8.0",
+              groups: [],
+              source: nil,
+              metadata: { property_name: "corektx" }
+            }],
+            previous_requirements: [{
+              file: "gradle/libs.versions.toml",
+              requirement: "1.7.0",
+              groups: [],
+              source: nil,
+              metadata: { property_name: "corektx" }
+            }],
+            package_manager: "gradle"
+          )
+        end
+
+        before do
+          allow(Dependabot::SharedHelpers).to receive(:run_shell_command) do |_command, cwd:|
+            File.write(
+              File.join(cwd, "gradle.lockfile"),
+              "androidx.core:core-ktx:1.8.0=compileClasspath\nempty=\n"
+            )
+          end
+        end
+
+        it "updates the version catalog and the lockfile" do
+          expect(updated_files.map(&:name)).to contain_exactly("gradle/libs.versions.toml", "gradle.lockfile")
+          expect(updated_files.find { |f| f.name == "gradle/libs.versions.toml" }.content)
+            .to include('corektx = "1.8.0"')
+          expect(updated_files.find { |f| f.name == "gradle.lockfile" }.content)
+            .to include("androidx.core:core-ktx:1.8.0")
         end
       end
 

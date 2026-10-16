@@ -1,6 +1,8 @@
 # typed: false
 # frozen_string_literal: true
 
+# Sorbet cannot resolve child-context-only fixtures and dynamically nested error constants.
+
 require "spec_helper"
 
 require "dependabot/dependency_file"
@@ -11,6 +13,17 @@ require "dependabot/requirements_update_strategy"
 require_common_spec "update_checkers/shared_examples_for_update_checkers"
 
 RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
+  def build_vulnerability_audit(attributes)
+    Dependabot::UpdateCheckers::VulnerabilityAudit.from_object(
+      {
+        "dependency_name" => dependency.name,
+        "fix_available" => false,
+        "fix_updates" => [],
+        "top_level_ancestors" => []
+      }.merge(attributes)
+    )
+  end
+
   let(:dependency_version) { "1.0.0" }
   let(:dependency) do
     Dependabot::Dependency.new(
@@ -41,6 +54,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
   let(:requirements_update_strategy) { nil }
   let(:security_advisories) { [] }
   let(:ignored_versions) { [] }
+  let(:update_cooldown) { nil }
   let(:checker) do
     described_class.new(
       dependency: dependency,
@@ -49,6 +63,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
       ignored_versions: ignored_versions,
       security_advisories: security_advisories,
       requirements_update_strategy: requirements_update_strategy,
+      update_cooldown: update_cooldown,
       options: options
     )
   end
@@ -58,18 +73,11 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
   let(:registry_listing_url) { "#{registry_base}/#{escaped_dependency_name}" }
   let(:registry_base) { "https://registry.npmjs.org" }
 
-  # Variable to control the enabling feature flag for the corepack fix
-  let(:enable_corepack_for_npm_and_yarn) { true }
-
   before do
     stub_request(:get, registry_listing_url)
       .to_return(status: 200, body: registry_response)
     stub_request(:head, "#{registry_base}/#{dependency_name}/-/#{unscoped_dependency_name}-#{target_version}.tgz")
       .to_return(status: 200)
-    allow(Dependabot::Experiments).to receive(:enabled?)
-      .with(:enable_corepack_for_npm_and_yarn).and_return(enable_corepack_for_npm_and_yarn)
-    allow(Dependabot::Experiments).to receive(:enabled?)
-      .with(:enable_private_registry_for_corepack).and_return(true)
     allow(Dependabot::Experiments).to receive(:enabled?)
       .with(:enable_audit_fix_fallback).and_return(false)
   end
@@ -79,6 +87,26 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
   end
 
   it_behaves_like "an update checker"
+
+  describe "#initialize" do
+    it "activates the npm selector for the dependency files" do
+      allow(Dependabot::NpmAndYarn::Helpers).to receive(:activate_npm_version_selector)
+
+      checker
+
+      expect(Dependabot::NpmAndYarn::Helpers).to have_received(:activate_npm_version_selector)
+        .with(dependency_files)
+    end
+
+    it "sets the registry context before activating the npm selector" do
+      expect(Dependabot::NpmAndYarn::Helpers).to receive(:dependency_files=).with(dependency_files).ordered
+      expect(Dependabot::NpmAndYarn::Helpers).to receive(:credentials=).with(credentials).ordered
+      expect(Dependabot::NpmAndYarn::Helpers).to receive(:activate_npm_version_selector)
+        .with(dependency_files).ordered
+
+      checker
+    end
+  end
 
   describe "#vulnerable?" do
     context "when the dependency has multiple versions" do
@@ -534,6 +562,40 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
 
           it { is_expected.to be_nil }
         end
+
+        context "with a cooldown period configured" do
+          let(:update_cooldown) do
+            Dependabot::Package::ReleaseCooldownOptions.new(default_days: 90)
+          end
+
+          before do
+            allow(checker.send(:git_commit_checker))
+              .to receive(:refs_for_tag_with_detail)
+              .and_return(
+                [
+                  Dependabot::GitTagWithDetail.new(tag: "3.0.0", release_date: "2018-01-02"),
+                  Dependabot::GitTagWithDetail.new(
+                    tag: "4.0.0",
+                    release_date: Time.now.strftime("%Y-%m-%d")
+                  )
+                ]
+              )
+          end
+
+          it "skips the version tag still within its cooldown window" do
+            expect(checker.latest_version)
+              .to eq("af885e2e890b9ef0875edd2b117305119ee5bdc5")
+          end
+
+          context "when there is no cooldown (e.g. a security update)" do
+            let(:update_cooldown) { nil }
+
+            it "uses the latest version tag" do
+              expect(checker.latest_version)
+                .to eq("0c6b15a88bc10cd47f67a09506399dfc9ddc075d")
+            end
+          end
+        end
       end
 
       context "with a requirement" do
@@ -590,10 +652,10 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
       before do
         allow(described_class::VulnerabilityAuditor).to receive(:new).and_return(vulnerability_auditor)
         allow(vulnerability_auditor).to receive(:audit).and_return(
-          {
+          build_vulnerability_audit(
             "fix_available" => true,
             "top_level_ancestors" => %w(applause lodash)
-          }
+          )
         )
       end
 
@@ -633,7 +695,8 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
             dependency_files: dependency_files,
             ignored_versions: ignored_versions,
             latest_allowable_version: Dependabot::NpmAndYarn::Version.new("1.0.1"),
-            repo_contents_path: nil
+            repo_contents_path: nil,
+            security_advisories: security_advisories
           ).and_return(dummy_version_resolver)
         expect(dummy_version_resolver)
           .to receive(:latest_resolvable_version)
@@ -698,7 +761,8 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
               dependency_files: dependency_files,
               ignored_versions: ignored_versions,
               latest_allowable_version: Dependabot::NpmAndYarn::Version.new("1.0.1"),
-              repo_contents_path: nil
+              repo_contents_path: nil,
+              security_advisories: security_advisories
             ).and_return(dummy_version_resolver)
           expect(dummy_version_resolver)
             .to receive(:latest_resolvable_version)
@@ -866,7 +930,8 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
             dependency_files: dependency_files,
             ignored_versions: ignored_versions,
             latest_allowable_version: Dependabot::NpmAndYarn::Version.new("1.0.1"),
-            repo_contents_path: nil
+            repo_contents_path: nil,
+            security_advisories: security_advisories
           ).and_return(dummy_version_resolver)
         expect(dummy_version_resolver)
           .to receive(:latest_resolvable_version)
@@ -1887,7 +1952,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
 
       context "when a fix_update has the same target and current version" do
         let(:vulnerability_audit_result) do
-          {
+          build_vulnerability_audit(
             "fix_available" => true,
             "target_version" => "1.0.1",
             "fix_updates" => [
@@ -1899,7 +1964,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
               }
             ],
             "top_level_ancestors" => ["@dependabot-fixtures/npm-parent-dependency"]
-          }
+          )
         end
 
         it "skips the no-op fix_update and updates the target dependency directly" do
@@ -1912,7 +1977,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
 
       context "when there are both no-op and real fix_updates" do
         let(:vulnerability_audit_result) do
-          {
+          build_vulnerability_audit(
             "fix_available" => true,
             "target_version" => "1.0.1",
             "fix_updates" => [
@@ -1930,7 +1995,7 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
               }
             ],
             "top_level_ancestors" => ["@dependabot-fixtures/npm-parent-dependency"]
-          }
+          )
         end
 
         it "skips the no-op and includes the real update with information_only target" do
@@ -2047,12 +2112,27 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
           .to eq(
             "dependency_name" => "@dependabot-fixtures/npm-transitive-dependency",
             "explanation" =>
-              "Dependabot could not find a lockfile update that resolves " \
-              "@dependabot-fixtures/npm-transitive-dependency to a " \
-              "non-vulnerable version.",
+              "@dependabot-fixtures/npm-transitive-dependency can't be automatically updated to a " \
+              "non-vulnerable version. The following top-level dependencies still require a vulnerable " \
+              "@dependabot-fixtures/npm-transitive-dependency and need to be updated:\n" \
+              "  - @dependabot-fixtures/npm-parent-dependency-5: requires " \
+              "@dependabot-fixtures/npm-transitive-dependency@1.0.0 " \
+              "(via @dependabot-fixtures/npm-intermediate-dependency@0.0.1)\n\n" \
+              "To resolve this, update @dependabot-fixtures/npm-parent-dependency-5 to a release that depends " \
+              "on a non-vulnerable @dependabot-fixtures/npm-transitive-dependency, or add an " \
+              "override/resolution pinning @dependabot-fixtures/npm-transitive-dependency to a non-vulnerable " \
+              "version.",
             "fix_available" => false,
             "fix_updates" => [],
-            "top_level_ancestors" => []
+            "top_level_ancestors" => [],
+            "blocking_dependencies" => [
+              {
+                "name" => "@dependabot-fixtures/npm-intermediate-dependency",
+                "version" => "0.0.1",
+                "requirement" => "1.0.0",
+                "top_level_ancestor" => "@dependabot-fixtures/npm-parent-dependency-5"
+              }
+            ]
           )
       end
     end
@@ -2110,7 +2190,15 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
               "available update path still resolves it to 1.0.0",
             "fix_available" => false,
             "fix_updates" => [],
-            "top_level_ancestors" => []
+            "top_level_ancestors" => [],
+            "blocking_dependencies" => [
+              {
+                "name" => "@dependabot-fixtures/npm-intermediate-dependency",
+                "version" => "0.0.1",
+                "requirement" => "1.0.0",
+                "top_level_ancestor" => "@dependabot-fixtures/npm-parent-dependency"
+              }
+            ]
           )
       end
     end
@@ -2410,6 +2498,151 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
       expect(checker.update_cooldown.default_days).to eq(3)
     end
 
+    it "logs that the npmrc value is applied because no dependabot.yml cooldown is set" do
+      allow(Dependabot.logger).to receive(:info)
+
+      checker
+
+      expect(Dependabot.logger).to have_received(:info).with(
+        ".npmrc min-release-age (3 days) is applied as the cooldown because no dependabot.yml cooldown is configured."
+      )
+    end
+
+    context "when .npmrc sets min-release-age more than once" do
+      let(:dependency_files) do
+        project_dependency_files("npm6/npmrc_min_release_age").reject { |f| f.name == ".npmrc" } +
+          [Dependabot::DependencyFile.new(name: ".npmrc", content: "min-release-age=3\nmin-release-age=30\n")]
+      end
+
+      it "uses the last value, which is the one npm enforces" do
+        expect(checker.update_cooldown.default_days).to eq(30)
+      end
+    end
+
+    context "when several .npmrc files set different values" do
+      let(:dependency_files) do
+        project_dependency_files("npm6/npmrc_min_release_age").reject { |f| f.name == ".npmrc" } +
+          [
+            Dependabot::DependencyFile.new(name: ".npmrc", content: "min-release-age=3\n"),
+            Dependabot::DependencyFile.new(name: "packages/app/.npmrc", content: "min-release-age=14\n")
+          ]
+      end
+
+      it "uses the highest value" do
+        expect(checker.update_cooldown.default_days).to eq(14)
+      end
+    end
+
+    context "when min-release-age has a quoted value and a trailing comment" do
+      let(:dependency_files) do
+        project_dependency_files("npm6/npmrc_min_release_age").reject { |f| f.name == ".npmrc" } +
+          [Dependabot::DependencyFile.new(name: ".npmrc", content: "min-release-age=\"5\" # a few days\n")]
+      end
+
+      it "parses the value" do
+        expect(checker.update_cooldown.default_days).to eq(5)
+      end
+    end
+
+    context "when min-release-age is not a number" do
+      let(:dependency_files) do
+        project_dependency_files("npm6/npmrc_min_release_age").reject { |f| f.name == ".npmrc" } +
+          [Dependabot::DependencyFile.new(name: ".npmrc", content: "min-release-age=soon\n")]
+      end
+
+      it "does not apply a cooldown" do
+        expect(checker.update_cooldown).to be_nil
+      end
+    end
+
+    context "when one .npmrc has a numeric value and another has a non-numeric value" do
+      let(:dependency_files) do
+        project_dependency_files("npm6/npmrc_min_release_age").reject { |f| f.name == ".npmrc" } +
+          npmrc_files
+      end
+      let(:npmrc_files) do
+        [
+          Dependabot::DependencyFile.new(name: ".npmrc", content: "min-release-age=30\n"),
+          Dependabot::DependencyFile.new(name: "packages/app/.npmrc", content: "min-release-age=soon\n")
+        ]
+      end
+
+      it "keeps the numeric gate instead of discarding it" do
+        expect(checker.update_cooldown.default_days).to eq(30)
+      end
+
+      context "when the non-numeric file comes first" do
+        let(:npmrc_files) { super().reverse }
+
+        it "keeps the numeric gate" do
+          expect(checker.update_cooldown.default_days).to eq(30)
+        end
+      end
+    end
+
+    context "when .npmrc does not set min-release-age" do
+      let(:dependency_files) do
+        project_dependency_files("npm6/npmrc_min_release_age").reject { |f| f.name == ".npmrc" } +
+          [Dependabot::DependencyFile.new(name: ".npmrc", content: "registry=https://registry.npmjs.org/\n")]
+      end
+
+      it "does not apply a cooldown" do
+        expect(checker.update_cooldown).to be_nil
+      end
+    end
+
+    context "when min-release-age is explicitly 0" do
+      let(:dependency_files) do
+        project_dependency_files("npm6/npmrc_min_release_age").reject { |f| f.name == ".npmrc" } +
+          [Dependabot::DependencyFile.new(name: ".npmrc", content: "min-release-age=0\n")]
+      end
+
+      it "does not apply a cooldown" do
+        expect(checker.update_cooldown).to be_nil
+      end
+
+      context "when a dependabot.yml cooldown is also set" do
+        let(:checker) do
+          described_class.new(
+            dependency: dependency,
+            dependency_files: dependency_files,
+            credentials: credentials,
+            update_cooldown: Dependabot::Package::ReleaseCooldownOptions.new(default_days: 5),
+            options: options
+          )
+        end
+
+        it "keeps the dependabot.yml cooldown unchanged" do
+          expect(checker.update_cooldown.default_days).to eq(5)
+        end
+      end
+    end
+
+    context "when this is a security update" do
+      let(:security_advisories) do
+        [
+          Dependabot::SecurityAdvisory.new(
+            dependency_name: dependency.name,
+            package_manager: "npm_and_yarn",
+            vulnerable_versions: ["< 99.0.0"]
+          )
+        ]
+      end
+
+      it "does not apply the npmrc min-release-age cooldown floor" do
+        expect(checker.update_cooldown).to be_nil
+      end
+
+      it "logs that the npmrc value is bypassed" do
+        allow(Dependabot.logger).to receive(:info)
+
+        checker
+
+        expect(Dependabot.logger).to have_received(:info)
+          .with(".npmrc min-release-age (3 days) is bypassed for this security update.")
+      end
+    end
+
     context "when an explicit update_cooldown already exceeds the npmrc floor" do
       let(:checker) do
         described_class.new(
@@ -2424,6 +2657,17 @@ RSpec.describe Dependabot::NpmAndYarn::UpdateChecker do
       it "keeps default_days unchanged and logs no warning" do
         expect(Dependabot.logger).not_to receive(:warn)
         expect(checker.update_cooldown.default_days).to eq(10)
+      end
+
+      it "logs that the dependabot.yml cooldown is used" do
+        allow(Dependabot.logger).to receive(:info)
+
+        checker
+
+        expect(Dependabot.logger).to have_received(:info).with(
+          ".npmrc min-release-age (3 days) is already satisfied by all dependabot.yml update_cooldown " \
+          "values; the dependabot.yml cooldown is used."
+        )
       end
     end
 

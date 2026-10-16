@@ -1,4 +1,5 @@
 # typed: false
+# Sorbet cannot resolve child-context manifest and lockfile fixtures. https://srb.help/7003
 # frozen_string_literal: true
 
 require "spec_helper"
@@ -379,6 +380,40 @@ RSpec.describe Dependabot::Python::FileParser::PyprojectFilesParser do
             type: "registry",
             url: "https://some.internal.registry.com/pypi/",
             name: "custom"
+          }
+        )
+      end
+    end
+
+    context "with a reserved PyPI source and a private source" do
+      subject(:dependency) { dependencies.find { |dep| dep.name == "requests" } }
+
+      let(:pyproject_body) do
+        <<~TOML
+          [tool.poetry]
+          name = "source-test"
+          version = "0.1.0"
+
+          [tool.poetry.dependencies]
+          python = "^3.12"
+          requests = { version = "^2.0", source = "private" }
+
+          [[tool.poetry.source]]
+          name = "pypi"
+          priority = "explicit"
+
+          [[tool.poetry.source]]
+          name = "private"
+          url = "https://private.example.com/simple"
+        TOML
+      end
+
+      it "resolves the referenced source without requiring a URL on PyPI" do
+        expect(dependency.requirements.first[:source]).to eq(
+          {
+            type: "registry",
+            url: "https://private.example.com/simple",
+            name: "private"
           }
         )
       end
@@ -955,6 +990,46 @@ RSpec.describe Dependabot::Python::FileParser::PyprojectFilesParser do
 
         actual_deps = dependencies.map { |dep| { name: dep.name, version: dep.version } }
         expect(actual_deps).to match_array(expected_deps)
+      end
+    end
+  end
+
+  describe "malformed parsed data" do
+    context "with a malformed Poetry dependency" do
+      let(:pyproject_body) do
+        <<~TOML
+          [tool.poetry.dependencies]
+          requests = 123
+        TOML
+      end
+
+      it "raises at the TOML boundary" do
+        expect { parser.dependency_set }
+          .to raise_error(TypeError, "Poetry dependency requests must be a string, object, or array")
+      end
+    end
+
+    context "with a malformed successful helper result" do
+      let(:pyproject_body) do
+        <<~TOML
+          [project]
+          dependencies = ["requests>=2"]
+        TOML
+      end
+
+      before do
+        allow(Dependabot::SharedHelpers)
+          .to receive(:run_helper_subprocess)
+          .and_return([{
+            "file" => "pyproject.toml",
+            "requirement" => ">=2",
+            "extras" => []
+          }])
+      end
+
+      it "raises at the helper boundary" do
+        expect { parser.dependency_set }
+          .to raise_error(TypeError, "PEP dependency name must be a string")
       end
     end
   end

@@ -1,4 +1,5 @@
 # typed: false
+# Sorbet cannot resolve child fixtures and shared-example locals. https://srb.help/7003
 # frozen_string_literal: true
 
 require "spec_helper"
@@ -275,6 +276,15 @@ RSpec.describe Dependabot::Devcontainers::FileParser do
 
   context "with deprecated features" do
     let(:project_name) { "deprecated" }
+    let(:directory) { "/" }
+
+    it "ignores them" do
+      expect(dependencies).to be_empty
+    end
+  end
+
+  context "with features referenced without a version tag" do
+    let(:project_name) { "untagged" }
     let(:directory) { "/" }
 
     it "ignores them" do

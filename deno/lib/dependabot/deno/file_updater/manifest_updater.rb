@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "sorbet-runtime"
@@ -29,8 +29,8 @@ module Dependabot
           content = T.must(manifest.content).dup
 
           dependencies.each do |dep|
-            prev_reqs = (dep.previous_requirements || []).select { |r| r[:file] == manifest.name }
-            new_reqs = dep.requirements.select { |r| r[:file] == manifest.name }
+            prev_reqs = (dep.previous_requirements || []).select { |r| r.file == manifest.name }
+            new_reqs = dep.requirements.select { |r| r.file == manifest.name }
 
             prev_reqs.zip(new_reqs).each do |prev_req, new_req|
               content = apply_substitution(content, dep, prev_req, T.must(new_req))
@@ -52,14 +52,14 @@ module Dependabot
           params(
             content: String,
             dep: Dependabot::Dependency,
-            prev_req: T::Hash[Symbol, T.untyped],
-            new_req: T::Hash[Symbol, T.untyped]
+            prev_req: Dependabot::DependencyRequirement,
+            new_req: Dependabot::DependencyRequirement
           ).returns(String)
         end
         def apply_substitution(content, dep, prev_req, new_req)
-          source_type = prev_req[:source][:type]
-          prev_req_str = prev_req[:requirement]
-          new_req_str = new_req[:requirement]
+          source_type = T.must(prev_req.source_string("type"))
+          prev_req_str = prev_req.requirement_string
+          new_req_str = new_req.requirement_string
 
           base = "#{source_type}:#{dep.name}"
           old_specifier = prev_req_str ? "#{base}@#{prev_req_str}" : base

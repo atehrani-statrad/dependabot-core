@@ -59,6 +59,7 @@ module Dependabot
 
         sig { void }
         def perform
+          report_missing_job_dependencies
           run_grouped_dependency_updates if dependency_snapshot.groups.any?
           run_ungrouped_dependency_updates unless job.multi_ecosystem_update?
         end
@@ -95,7 +96,7 @@ module Dependabot
               Dependabot.logger.info(
                 "Deferring creation of a new pull request. The existing pull request will update in a separate job."
               )
-              dependency_snapshot.mark_group_handled(group)
+              dependency_snapshot.mark_group_handled(group, defer_update_types: true)
               next
             end
 
@@ -105,7 +106,7 @@ module Dependabot
           groups_without_pr.each do |group|
             dependency_change = run_grouped_update_for(group)
             # The update failed, add the suspected dependencies to the handled list so they don't update individually.
-            dependency_snapshot.mark_group_handled(group) if dependency_change.nil?
+            dependency_snapshot.mark_group_handled(group, defer_update_types: true) if dependency_change.nil?
           end
         end
 

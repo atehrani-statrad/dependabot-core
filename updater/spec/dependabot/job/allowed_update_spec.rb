@@ -6,94 +6,60 @@ require "dependabot/job/allowed_update"
 
 RSpec.describe Dependabot::Job::AllowedUpdate do
   describe ".from_hash" do
-    context "with default values" do
-      it "parses a minimal hash" do
-        update = described_class.from_hash({})
-        expect(update.dependency_name).to be_nil
-        expect(update.dependency_type).to eq("all")
-        expect(update.update_type).to eq("all")
-        expect(update.update_types).to eq([])
-        expect(update.prerelease).to be_nil
-      end
+    it "parses an allowed update" do
+      update = described_class.from_hash(
+        {
+          "dependency-name" => "rails",
+          "dependency-type" => "direct",
+          "update-type" => "security",
+          "update-types" => ["version-update:semver-minor"]
+        }
+      )
+
+      expect(update).to have_attributes(
+        dependency_name: "rails",
+        dependency_type: "direct",
+        update_type: "security",
+        update_types: ["version-update:semver-minor"]
+      )
     end
 
-    context "with prerelease: true" do
-      it "parses the prerelease field" do
-        update = described_class.from_hash({
-          "dependency-name" => "MyCompany.*",
-          "prerelease" => true
-        })
-        expect(update.dependency_name).to eq("MyCompany.*")
-        expect(update.prerelease).to be(true)
-      end
+    it "uses defaults for absent or nil values" do
+      update = described_class.from_hash(
+        {
+          "dependency-type" => nil,
+          "update-type" => nil,
+          "update-types" => nil
+        }
+      )
+
+      expect(update).to have_attributes(
+        dependency_name: nil,
+        dependency_type: "all",
+        update_type: "all",
+        update_types: []
+      )
     end
 
-    context "with prerelease: false" do
-      it "parses the prerelease field as false" do
-        update = described_class.from_hash({
-          "dependency-name" => "Some.Package",
-          "prerelease" => false
-        })
-        expect(update.prerelease).to be(false)
-      end
+    it "fails for a malformed dependency name" do
+      expect do
+        described_class.from_hash("dependency-name" => 1)
+      end.to raise_error(TypeError, /dependency-name/)
     end
 
-    context "without prerelease key" do
-      it "defaults prerelease to nil" do
-        update = described_class.from_hash({
-          "dependency-name" => "Some.Package"
-        })
-        expect(update.prerelease).to be_nil
-      end
-    end
-  end
-
-  describe "#to_hash" do
-    context "when prerelease is nil" do
-      it "omits prerelease from the hash" do
-        update = described_class.from_hash({ "dependency-name" => "Some.Package" })
-        hash = update.to_hash
-        expect(hash).not_to have_key("prerelease")
-      end
+    it "defaults prerelease to nil when absent" do
+      expect(described_class.from_hash({}).prerelease).to be_nil
     end
 
-    context "when prerelease is true" do
-      it "includes prerelease in the hash" do
-        update = described_class.from_hash({
-          "dependency-name" => "MyCompany.*",
-          "prerelease" => true
-        })
-        hash = update.to_hash
-        expect(hash["prerelease"]).to be(true)
-        expect(hash["dependency-name"]).to eq("MyCompany.*")
-      end
+    it "parses prerelease booleans" do
+      expect(described_class.from_hash("prerelease" => true).prerelease).to be(true)
+      expect(described_class.from_hash("prerelease" => false).prerelease).to be(false)
     end
 
-    context "when prerelease is false" do
-      it "includes prerelease as false in the hash" do
-        update = described_class.from_hash({
-          "dependency-name" => "Some.Package",
-          "prerelease" => false
-        })
-        hash = update.to_hash
-        expect(hash["prerelease"]).to be(false)
-      end
-    end
-  end
-
-  describe "round-trip serialization" do
-    it "preserves the prerelease flag through from_hash and to_hash" do
-      original = {
-        "dependency-name" => "MyCompany.*",
-        "dependency-type" => "all",
-        "update-type" => "all",
-        "prerelease" => true
-      }
-      update = described_class.from_hash(original)
-      result = update.to_hash
-
-      expect(result["dependency-name"]).to eq("MyCompany.*")
-      expect(result["prerelease"]).to be(true)
+    it "fails for a malformed prerelease value" do
+      expect do
+        described_class.from_hash("prerelease" => "yes")
+      end.to raise_error(TypeError, /prerelease/)
     end
   end
 end

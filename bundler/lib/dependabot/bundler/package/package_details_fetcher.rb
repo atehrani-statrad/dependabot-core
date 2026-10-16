@@ -3,7 +3,6 @@
 
 require "json"
 require "time"
-require "cgi"
 require "excon"
 require "nokogiri"
 require "sorbet-runtime"
@@ -22,6 +21,7 @@ module Dependabot
         include Dependabot::Bundler::UpdateChecker::SharedBundlerHelpers
 
         RELEASES_URL = "%s/api/v1/versions/%s.json"
+        COMPACT_INDEX_URL = "%s/info/%s"
         GEM_URL = "%s/gems/%s.gem"
         PACKAGE_TYPE = "gem"
         PACKAGE_LANGUAGE = "ruby"
@@ -143,12 +143,58 @@ module Dependabot
             error_msg = "Failed to fetch versions for '#{dependency.name}' from '#{registry_url}'. " \
                         "Status: #{response.status}"
             log_error(error_msg)
-            return package_details([])
+            return fetch_compact_index_response(registry_url)
           end
 
           return handle_empty_response(registry_url) if response.body.nil? || response.body.strip.empty?
 
           parse_rubygems_response(response, registry_url)
+        end
+
+        sig { params(registry_url: String).returns(Dependabot::Package::PackageDetails) }
+        def fetch_compact_index_response(registry_url)
+          response = Dependabot::RegistryClient.get(
+            url: format(COMPACT_INDEX_URL, registry_url, dependency.name),
+            headers: { "Accept" => "text/plain" }
+          )
+          return package_details([]) unless response.status == 200
+
+          lines = response.body.to_s.lines(chomp: true).drop_while { |line| line != "---" }.drop(1)
+          releases = lines.filter_map { |line| compact_index_release(line, registry_url) }
+          package_details(releases)
+        end
+
+        sig do
+          params(line: String, registry_url: String).returns(T.nilable(Dependabot::Package::PackageRelease))
+        end
+        def compact_index_release(line, registry_url)
+          version_and_platform = line.split(" ", 2).first
+          return nil unless version_and_platform && line.include?("|")
+
+          version = T.must(version_and_platform.split("-", 2).first)
+          return nil unless Dependabot::Bundler::Version.correct?(version)
+
+          metadata = line.partition("|").last.split(",").to_h do |field|
+            key, _, value = field.partition(":")
+            [key, value]
+          end
+
+          package_release(
+            version: version,
+            released_at: compact_index_release_date(metadata["created_at"]),
+            downloads: 0,
+            url: format(GEM_URL, registry_url, "#{dependency.name}-#{version_and_platform}"),
+            ruby_version: metadata["ruby"]&.tr("&", ",")
+          )
+        rescue Gem::Requirement::BadRequirementError
+          nil
+        end
+
+        sig { params(created_at: T.nilable(String)).returns(T.nilable(Time)) }
+        def compact_index_release_date(created_at)
+          Time.iso8601(created_at) if created_at
+        rescue ArgumentError
+          nil
         end
 
         sig do
@@ -215,9 +261,9 @@ module Dependabot
           return nil unless dependency&.requirements&.any?
 
           first_requirement = dependency.requirements.first
-          return nil unless first_requirement && first_requirement[:source]
+          return nil unless first_requirement
 
-          url = T.let(first_requirement[:source][:url], T.nilable(String))
+          url = first_requirement.source_string("url")
           return nil unless url
 
           url.end_with?("/") ? url.chop : url
@@ -243,9 +289,9 @@ module Dependabot
           return nil unless dependency.requirements.any?
 
           first_requirement = dependency.requirements.first
-          return nil unless first_requirement && first_requirement[:source]
+          return nil unless first_requirement
 
-          first_requirement[:source][:type]
+          first_requirement.source_string("type")
         end
 
         sig { override.returns(String) }
@@ -270,7 +316,7 @@ module Dependabot
         sig do
           params(
             version: String,
-            released_at: Time,
+            released_at: T.nilable(Time),
             downloads: Integer,
             url: String,
             ruby_version: T.nilable(String),

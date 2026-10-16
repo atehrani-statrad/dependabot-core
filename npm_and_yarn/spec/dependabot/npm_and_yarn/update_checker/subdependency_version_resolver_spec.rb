@@ -1,6 +1,8 @@
 # typed: false
 # frozen_string_literal: true
 
+# Sorbet cannot resolve the dynamic describe constant or its child-context-only dependency fixture.
+
 require "spec_helper"
 require "dependabot/dependency"
 require "dependabot/dependency_file"
@@ -32,14 +34,7 @@ RSpec.describe namespace::SubdependencyVersionResolver do
   end
   let(:ignored_versions) { [] }
 
-  # Variable to control the enabling feature flag for the corepack fix
-  let(:enable_corepack_for_npm_and_yarn) { true }
-
   before do
-    allow(Dependabot::Experiments).to receive(:enabled?)
-      .with(:enable_corepack_for_npm_and_yarn).and_return(enable_corepack_for_npm_and_yarn)
-    allow(Dependabot::Experiments).to receive(:enabled?)
-      .with(:enable_private_registry_for_corepack).and_return(true)
     allow(Dependabot::Experiments).to receive(:enabled?)
       .with(:enable_audit_fix_fallback).and_return(true)
   end
@@ -178,11 +173,18 @@ RSpec.describe namespace::SubdependencyVersionResolver do
           package_manager: "npm_and_yarn"
         )
       end
-      let(:latest_allowable_version) { "6.0.2" }
+      # pnpm refuses the pin on a transitive package, and the retry resolves acorn to the newest version
+      # the dependents' ranges allow (5.7.4), whatever the bound is. That resolution is proposed when it
+      # is within the bound.
+      let(:latest_allowable_version) { "5.7.4" }
 
-      # NOTE: The latest version is 6.0.2, but we can't reach it as other
-      # dependencies constrain us
       it { is_expected.to eq(Gem::Version.new("5.7.4")) }
+
+      context "when the resolution is above the allowable version" do
+        let(:latest_allowable_version) { "5.5.0" }
+
+        it { is_expected.to be_nil }
+      end
     end
 
     context "with a pnpm workspace subdependency" do
@@ -217,6 +219,68 @@ RSpec.describe namespace::SubdependencyVersionResolver do
         latest_resolvable_version
       end
 
+      it "retries without the version when pnpm refuses to pin the subdependency" do
+        allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command).and_return("")
+        allow(Dependabot::NpmAndYarn::NativeHelpers)
+          .to receive_messages(run_pnpm_deep_update_command: "", run_pnpm_audit_fix_command: "")
+
+        expect(Dependabot::NpmAndYarn::Helpers)
+          .to receive(:run_pnpm_command)
+          .with(
+            "update lodash@3.10.2 --lockfile-only --no-save -r",
+            { fingerprint: "update <dependency_name>@<latest_allowable_version> --lockfile-only --no-save -r" }
+          )
+          .ordered
+          .and_raise(
+            Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+              message: "ERR_PNPM_UPDATE_VERSION_ON_INDIRECT_DEP  \"lodash\" (requested \"3.10.2\") is not a " \
+                       "direct dependency, so the requested version cannot be recorded.",
+              error_context: {}
+            )
+          )
+        expect(Dependabot::NpmAndYarn::Helpers)
+          .to receive(:run_pnpm_command)
+          .with(
+            "update lodash --lockfile-only --no-save -r",
+            { fingerprint: "update <dependency_name> --lockfile-only --no-save -r" }
+          )
+          .ordered
+
+        latest_resolvable_version
+      end
+
+      context "when the retry resolves the package at every depth" do
+        let(:pinned_update) { "update lodash@3.10.2 --lockfile-only --no-save -r" }
+        let(:unpinned_update) { "update lodash --lockfile-only --no-save -r" }
+
+        before do
+          allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command).and_return("")
+          allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command)
+            .with(pinned_update, anything)
+            .and_raise(
+              Dependabot::SharedHelpers::HelperSubprocessFailed.new(
+                message: "ERR_PNPM_UPDATE_VERSION_ON_INDIRECT_DEP  \"lodash\" (requested \"3.10.2\") is not a " \
+                         "direct dependency, so the requested version cannot be recorded.",
+                error_context: {}
+              )
+            )
+        end
+
+        it "returns the resolved version when every new resolution is within the bound" do
+          allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command)
+            .with(unpinned_update, anything) { rewrite_lockfile_lodash("3.10.2") }
+
+          expect(latest_resolvable_version).to eq(Gem::Version.new("3.10.2"))
+        end
+
+        it "returns no update when another occurrence resolves above the bound" do
+          allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command)
+            .with(unpinned_update, anything) { rewrite_lockfile_lodash("3.10.2", extra: "3.10.3") }
+
+          expect(latest_resolvable_version).to be_nil
+        end
+      end
+
       it "falls back to pnpm audit --fix when pnpm update is a no-op" do
         # Stub pnpm update to be a no-op (returns unchanged lockfile)
         allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command).and_return("")
@@ -229,7 +293,7 @@ RSpec.describe namespace::SubdependencyVersionResolver do
         latest_resolvable_version
       end
 
-      it "tries pnpm update --depth Infinity before pnpm audit --fix" do
+      it "tries a deep pnpm update before pnpm audit --fix" do
         allow(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command).and_return("")
         allow(Dependabot::NpmAndYarn::NativeHelpers)
           .to receive_messages(run_pnpm_deep_update_command: "", run_pnpm_audit_fix_command: "")
@@ -292,6 +356,37 @@ RSpec.describe namespace::SubdependencyVersionResolver do
       it "calls run_npm_updater" do
         expect(resolver).to receive(:run_npm_updater).and_call_original
         expect(latest_resolvable_version).to eq(Gem::Version.new("5.7.4"))
+      end
+
+      context "when resolving a security update" do
+        let(:resolver) do
+          described_class.new(
+            dependency: dependency,
+            dependency_files: dependency_files,
+            credentials: credentials,
+            ignored_versions: ignored_versions,
+            latest_allowable_version: latest_allowable_version,
+            repo_contents_path: nil,
+            security_advisories: [
+              Dependabot::SecurityAdvisory.new(
+                dependency_name: "acorn",
+                package_manager: "npm_and_yarn",
+                vulnerable_versions: ["< 5.7.4"]
+              )
+            ]
+          )
+        end
+
+        it "passes --min-release-age=0 so the .npmrc cooldown is bypassed" do
+          allow(Dependabot::NpmAndYarn::NativeHelpers)
+            .to receive_messages(run_npm8_subdependency_update_command: "", run_npm_audit_fix_command: "")
+
+          latest_resolvable_version
+
+          expect(Dependabot::NpmAndYarn::NativeHelpers)
+            .to have_received(:run_npm8_subdependency_update_command)
+            .with(["acorn"], min_release_age_arg: "--min-release-age=0")
+        end
       end
 
       it "calls npm audit fix as a fallback" do
@@ -517,4 +612,20 @@ RSpec.describe namespace::SubdependencyVersionResolver do
       end
     end
   end
+end
+
+# Stands in for pnpm in the temporary directory the update runs in: moves the
+# fixture's lodash to `version`, and gives es6-promise its own edge to lodash
+# at `extra` when given.
+def rewrite_lockfile_lodash(version, extra: nil)
+  content = File.read("pnpm-lock.yaml")
+  block = T.must(content[%r{^  /lodash@3\.10\.1:\n(?:    .*\n)+}])
+  content = content.gsub("/lodash@3.10.1:", "/lodash@#{version}:").gsub("lodash: 3.10.1", "lodash: #{version}")
+  if extra
+    content += block.gsub("3.10.1", extra)
+    es6_promise = "  /es6-promise@3.3.1:\n    resolution: {integrity: sha512-fakehash1==}\n"
+    content = content.sub(es6_promise, "#{es6_promise}    dependencies:\n      lodash: #{extra}\n")
+  end
+  File.write("pnpm-lock.yaml", content)
+  ""
 end

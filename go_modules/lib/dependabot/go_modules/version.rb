@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 # Go pre-release versions use 1.0.1-rc1 syntax, which Gem::Version
@@ -34,8 +34,11 @@ module Dependabot
         @version_string = T.let(version.to_s.gsub(/^v/, ""), String)
         version = version.gsub(/^v/, "") if version.is_a?(String)
         version = version.to_s.split("+").first if version.to_s.include?("+")
-        @prerelease = T.let(nil, T.nilable(String))
-        version, @prerelease = version.to_s.split("-", 2) if version.to_s.include?("-")
+        # NOTE: avoid the name `@prerelease`; RubyGems 4's Gem::Version#prerelease?
+        # memoizes its boolean result into an `@prerelease` ivar, so reusing that
+        # name here would corrupt the inherited prerelease? check.
+        @prerelease_suffix = T.let(nil, T.nilable(String))
+        version, @prerelease_suffix = version.to_s.split("-", 2) if version.to_s.include?("-")
 
         super
       end
@@ -50,20 +53,36 @@ module Dependabot
         @version_string
       end
 
+      # Go represents prereleases as a dash-suffix (e.g. "1.2.0-pre2"), which is
+      # stripped off before being handed to Gem::Version. As a result the parent's
+      # prerelease? check (which looks for alphabetic characters in the version it
+      # was given) can't see the suffix, so we report the suffix here and otherwise
+      # delegate to Gem::Version for dot-style prereleases such as "1.0.0.pre1".
+      sig { returns(T::Boolean) }
+      def prerelease?
+        suffix = @prerelease_suffix
+        return true if suffix && !suffix.empty?
+
+        super
+      end
+
       sig { params(other: Object).returns(T.nilable(Integer)) }
       def <=>(other)
         result = super
         return if result.nil?
         return result unless result.zero?
 
-        other = self.class.new(other.to_s) unless other.is_a?(Version)
-        compare_prerelease(@prerelease || "", T.unsafe(other).prerelease || "")
+        other_version = T.cast(
+          other.is_a?(Dependabot::GoModules::Version) ? other : self.class.new(other.to_s),
+          Dependabot::GoModules::Version
+        )
+        compare_prerelease(@prerelease_suffix || "", other_version.prerelease_suffix || "")
       end
 
       protected
 
       sig { returns(T.nilable(String)) }
-      attr_reader :prerelease
+      attr_reader :prerelease_suffix
 
       private
 

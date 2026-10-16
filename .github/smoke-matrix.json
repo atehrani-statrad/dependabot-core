@@ -1,5 +1,10 @@
 [
   {
+    "core": "apm",
+    "test": "apm",
+    "ecosystem": "apm"
+  },
+  {
     "core": "bazel",
     "test": "bazel",
     "ecosystem": "bazel"
@@ -68,6 +73,11 @@
     "core": "gradle",
     "test": "gradle",
     "ecosystem": "gradle"
+  },
+  {
+    "core": "helm",
+    "test": "helm",
+    "ecosystem": "helm"
   },
   {
     "core": "hex",

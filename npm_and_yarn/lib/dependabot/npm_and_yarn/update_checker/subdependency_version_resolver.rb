@@ -1,4 +1,4 @@
-# typed: strict
+# typed: strong
 # frozen_string_literal: true
 
 require "dependabot/dependency"
@@ -10,7 +10,9 @@ require "dependabot/npm_and_yarn/native_helpers"
 require "dependabot/npm_and_yarn/sub_dependency_files_filterer"
 require "dependabot/npm_and_yarn/update_checker"
 require "dependabot/npm_and_yarn/update_checker/dependency_files_builder"
+require "dependabot/npm_and_yarn/update_checker/pnpm_transitive_update"
 require "dependabot/npm_and_yarn/version"
+require "dependabot/security_advisory"
 require "dependabot/shared_helpers"
 require "sorbet-runtime"
 
@@ -38,6 +40,9 @@ module Dependabot
         sig { returns(T.nilable(String)) }
         attr_reader :repo_contents_path
 
+        sig { returns(T::Array[Dependabot::SecurityAdvisory]) }
+        attr_reader :security_advisories
+
         sig do
           params(
             dependency: Dependency,
@@ -45,7 +50,8 @@ module Dependabot
             dependency_files: T::Array[Dependabot::DependencyFile],
             ignored_versions: T::Array[String],
             latest_allowable_version: T.nilable(T.any(String, Gem::Version)),
-            repo_contents_path: T.nilable(String)
+            repo_contents_path: T.nilable(String),
+            security_advisories: T::Array[Dependabot::SecurityAdvisory]
           ).void
         end
         def initialize(
@@ -54,7 +60,8 @@ module Dependabot
           dependency_files:,
           ignored_versions:,
           latest_allowable_version:,
-          repo_contents_path:
+          repo_contents_path:,
+          security_advisories: []
         )
           @dependency = dependency
           @credentials = credentials
@@ -62,6 +69,8 @@ module Dependabot
           @ignored_versions = ignored_versions
           @latest_allowable_version = latest_allowable_version
           @repo_contents_path = repo_contents_path
+          @security_advisories = security_advisories
+          @pnpm_update = T.let(nil, T.nilable(PnpmTransitiveUpdate))
         end
 
         sig { returns(T.nilable(T.any(String, Gem::Version))) }
@@ -126,8 +135,23 @@ module Dependabot
 
           combined = version_class.new(parsed_dep.version)
           current_version = dependency.version ? version_class.new(dependency.version) : nil
-          audit_fix_version = audit_fix_best_version(parsed_dep, current_version)
-          audit_fix_version || combined
+          candidate = audit_fix_best_version(parsed_dep, current_version) || combined
+          return candidate unless pnpm_update.pin_dropped
+
+          candidate if pnpm_update.within_bound?(
+            candidate: candidate, before: dependency_files_builder.lockfiles, after: updated_lockfiles
+          )
+        end
+
+        sig { returns(PnpmTransitiveUpdate) }
+        def pnpm_update
+          @pnpm_update ||= PnpmTransitiveUpdate.new(dependency: dependency, latest_allowable_version: allowable_version)
+        end
+
+        sig { returns(T.nilable(Gem::Version)) }
+        def allowable_version
+          allowable = latest_allowable_version
+          allowable.is_a?(String) ? version_class.new(allowable) : allowable
         end
 
         sig do
@@ -140,7 +164,7 @@ module Dependabot
           return unless Dependabot::Experiments.enabled?(:enable_audit_fix_fallback)
           return unless current_version
 
-          all_versions = parsed_dep.metadata[:all_versions]
+          all_versions = parsed_dep.metadata_dependencies(:all_versions)
           return unless all_versions&.any?
 
           best_candidate_version(all_versions, current_version)
@@ -153,11 +177,7 @@ module Dependabot
           ).returns(T.nilable(Gem::Version))
         end
         def best_candidate_version(all_versions, current_version)
-          allowable = if latest_allowable_version.is_a?(String)
-                        version_class.new(latest_allowable_version)
-                      else
-                        latest_allowable_version
-                      end
+          allowable = allowable_version
 
           all_versions
             .filter_map { |d| version_class.new(d.version) if d.version }
@@ -229,10 +249,7 @@ module Dependabot
             Dir.chdir(path) do
               original_content = File.read(lockfile_name)
 
-              Helpers.run_pnpm_command(
-                pnpm_update_command,
-                fingerprint: pnpm_update_fingerprint
-              )
+              pnpm_update.run
 
               updated_content = File.read(lockfile_name)
               if updated_content == original_content && Dependabot::Experiments.enabled?(:enable_audit_fix_fallback)
@@ -250,43 +267,25 @@ module Dependabot
           end
         end
 
-        sig { returns(String) }
-        def pnpm_update_command
-          if latest_allowable_version
-            "update #{dependency.name}@#{latest_allowable_version} --lockfile-only --no-save -r"
-          else
-            "update #{dependency.name} --lockfile-only"
-          end
-        end
-
-        sig { returns(String) }
-        def pnpm_update_fingerprint
-          if latest_allowable_version
-            "update <dependency_name>@<latest_allowable_version> --lockfile-only --no-save -r"
-          else
-            "update <dependency_name> --lockfile-only"
-          end
-        end
-
-        # First-tier fallback: try `pnpm update --depth Infinity <dep>` to
+        # First-tier fallback: try a deep `pnpm update <dep>` to
         # update transitive dependencies in the lockfile without modifying
-        # any package.json (unlike `pnpm audit --fix`).
+        # manifests or relying on older pnpm audit fixes that may add overrides.
         sig { void }
         def run_pnpm_deep_update_fallback
+          pnpm_update.resolved_without_pin
           recursive = Dir.glob("**/pnpm-workspace.yaml").any?
           NativeHelpers.run_pnpm_deep_update_command(dependency.name, recursive: recursive)
           dependency.metadata[:deep_update_used] = true
         rescue SharedHelpers::HelperSubprocessFailed
           Dependabot.logger.info(
-            "pnpm update --depth Infinity failed or partially fixed — continuing with any changes made"
+            "pnpm deep update failed or partially fixed — continuing with any changes made"
           )
         end
 
-        # Runs `pnpm audit --fix` as a fallback when `pnpm update` is a no-op.
-        # `pnpm audit --fix` adds `overrides` to `package.json`, but this method
-        # only returns the lockfile. If audit-fix modifies any package.json we
-        # revert both the manifest(s) and lockfile so no inconsistent state is
-        # surfaced upstream.
+        # Runs the version-compatible `pnpm audit --fix` strategy when `pnpm update` is a no-op.
+        # pnpm 11 updates the lockfile directly, while older versions may add
+        # `overrides` to package.json. If any manifest changes, revert both the
+        # manifest(s) and lockfile so no inconsistent state is surfaced upstream.
         sig { params(lockfile_name: String, original_content: String).void }
         def run_pnpm_audit_fix_fallback(lockfile_name, original_content)
           package_json_snapshots = Dir.glob("**/package.json").to_h { |f| [f, File.read(f)] }
@@ -321,12 +320,17 @@ module Dependabot
             Dir.chdir(path) do
               original_content = File.read(lockfile_name)
 
-              NativeHelpers.run_npm8_subdependency_update_command([dependency.name])
+              NativeHelpers.run_npm8_subdependency_update_command(
+                [dependency.name],
+                min_release_age_arg: security_updates_only? ? "--min-release-age=0" : nil
+              )
 
               updated_content = File.read(lockfile_name)
               if updated_content == original_content && Dependabot::Experiments.enabled?(:enable_audit_fix_fallback)
                 begin
-                  NativeHelpers.run_npm_audit_fix_command
+                  NativeHelpers.run_npm_audit_fix_command(
+                    min_release_age_arg: security_updates_only? ? "--min-release-age=0" : nil
+                  )
                   dependency.metadata[:audit_fix_used] = true
                 rescue SharedHelpers::HelperSubprocessFailed
                   Dependabot.logger.info("npm audit fix failed or partially fixed — continuing with any changes made")
@@ -341,20 +345,31 @@ module Dependabot
 
         sig { params(path: String, lockfile_name: String).returns(T::Hash[String, String]) }
         def run_npm6_updater(path, lockfile_name)
-          SharedHelpers.with_git_configured(credentials: credentials) do
-            Dir.chdir(path) do
-              SharedHelpers.run_helper_subprocess(
-                command: NativeHelpers.helper_path,
-                function: "npm6:updateSubdependency",
-                args: [Dir.pwd, lockfile_name, [dependency.to_h]]
-              )
-            end
-          end
+          T.cast(
+            SharedHelpers.with_git_configured(credentials: credentials) do
+              Dir.chdir(path) do
+                SharedHelpers.run_helper_subprocess(
+                  command: NativeHelpers.helper_path,
+                  function: "npm6:updateSubdependency",
+                  args: [Dir.pwd, lockfile_name, [dependency.to_h]]
+                )
+              end
+            end,
+            T::Hash[String, String]
+          )
         end
 
         sig { returns(T.class_of(Dependabot::Version)) }
         def version_class
           dependency.version_class
+        end
+
+        # Security fixes must not be blocked by a min-release-age gate the user
+        # configured in .npmrc for regular updates, so the native npm commands
+        # are invoked with --min-release-age=0 when resolving a security fix.
+        sig { returns(T::Boolean) }
+        def security_updates_only?
+          security_advisories.any?
         end
 
         sig { returns(Dependabot::Dependency) }

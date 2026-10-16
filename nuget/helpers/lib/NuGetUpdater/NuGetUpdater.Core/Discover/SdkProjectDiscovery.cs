@@ -65,13 +65,15 @@ internal static class SdkProjectDiscovery
     // these targets are required to evaluate a legacy project with a single operation
     private static readonly ImmutableArray<string> LegacyProjectSingleRestoreTargetNames = ["ResolveProjectReferences"];
 
+    private const string TargetFrameworksPropertyName = "TargetFrameworks";
+
     // this property evaluates to a version number in an SDK-style project and is unset or empty otherwise
     private const string NETCoreSdkVersionPropertyName = "NETCoreSdkVersion";
 
     // this seems to be the maximum number of TFMs that can be restored in parallel without running into race conditions
     private const int MaximumParallelTargetFrameworkRestores = 2;
 
-    public static async Task<ImmutableArray<ProjectDiscoveryResult>> DiscoverAsync(string repoRootPath, string workspacePath, string startingProjectPath, ExperimentsManager experimentsManager, ILogger logger)
+    public static async Task<ImmutableArray<ProjectDiscoveryResult>> DiscoverAsync(string repoRootPath, string workspacePath, string startingProjectPath, ExperimentsManager experimentsManager, string? solutionDir, ILogger logger)
     {
         var extension = Path.GetExtension(startingProjectPath)?.ToLowerInvariant();
         switch (extension)
@@ -119,16 +121,30 @@ internal static class SdkProjectDiscovery
         Dictionary<string, HashSet<string>> additionalFiles = new(PathComparer.Instance);
         //    projectPath  additionalFiles
 
+        var startingProjectProperties = await MSBuildHelper.GetProjectPropertiesAsync(
+            startingProjectPath,
+            [TargetFrameworksPropertyName, NETCoreSdkVersionPropertyName],
+            logger
+        );
+        var projectTfms = MSBuildHelper.ParseProjectTargetFrameworks(startingProjectProperties?.GetValueOrDefault(TargetFrameworksPropertyName));
+        var netCoreSdkVersionValue = startingProjectProperties?.GetValueOrDefault(NETCoreSdkVersionPropertyName);
+        var isLegacyProject = string.IsNullOrEmpty(netCoreSdkVersionValue);
+        var requiredTargets = isLegacyProject
+            ? LegacyProjectSingleRestoreTargetNames
+            : SingleRestoreTargetNames;
+
         // due to how MSBuild handles multi-TFM projects with target platforms we may need to process each TFM separately
         // we detect that by determining if there are multiple target frameworks specified and if any of them have a platform suffix (e.g., `-windows`, `-android`, etc)
         // alternately, if there are too many target frameworks specified, they must be handled individually
-        var projectTfms = await MSBuildHelper.GetProjectTargetFrameworksAsync(startingProjectPath, logger);
         var hasPlatformTfms = projectTfms.Any(tfm => tfm.Contains('-'));
         var requiresIndividualRestores = hasPlatformTfms || projectTfms.Length > MaximumParallelTargetFrameworkRestores;
+        var useDirectRestore = requiresIndividualRestores;
         if (!requiresIndividualRestores)
         {
             logger.Info($"Performing single restore for project {startingProjectPath}");
             projectTfms = [string.Empty]; // a single restore can handle everything, but we need to loop at least once and an empty TFM is our signal to not specify anything
+            var actualTargets = await MSBuildHelper.GetProjectTargetsAsync(startingProjectPath, logger);
+            useDirectRestore = requiredTargets.All(actualTargets.Contains);
         }
         else
         {
@@ -158,15 +174,7 @@ internal static class SdkProjectDiscovery
                 // `ResolveProjectReferences` to gather all `PackageReference` items and further down we re-build the transitive
                 // dependency set.  Without the legacy project check, we could incorrectly invoke `Build` which eventually tries
                 // to call `csc.exe` which is unnecessary and can be slow.
-                var netCoreSdkVersionValue = await MSBuildHelper.GetProjectPropertyAsync(startingProjectPath, NETCoreSdkVersionPropertyName, logger);
-                var isLegacyProject = string.IsNullOrEmpty(netCoreSdkVersionValue);
-                var requiredTargets = isLegacyProject
-                    ? LegacyProjectSingleRestoreTargetNames
-                    : SingleRestoreTargetNames;
-
-                var actualTargets = await MSBuildHelper.GetProjectTargetsAsync(startingProjectPath, logger);
-                var useDirectRestore = requiredTargets.All(actualTargets.Contains);
-                if (useDirectRestore || isIndividualTfmRestore)
+                if (useDirectRestore)
                 {
                     // directly call the required targets
                     args.Add($"/t:{string.Join(",", requiredTargets)}");
@@ -178,6 +186,9 @@ internal static class SdkProjectDiscovery
                     args.Add($"/p:InnerTargets=\"{string.Join(";", requiredTargets)}\"");
                 }
 
+                // only execute the desired targets on transitive project references
+                args.Add($"/p:ProjectReferenceBuildTargets=\"{string.Join(";", requiredTargets)}\"");
+
                 // inject various props and targets to help with discovery
                 var dependencyDiscoveryTargetingPacksPropsPath = MSBuildHelper.GetFileFromRuntimeDirectory("DependencyDiscoveryTargetingPacks.props");
                 var dependencyDiscoveryTargetsPath = MSBuildHelper.GetFileFromRuntimeDirectory("DependencyDiscovery.targets");
@@ -188,6 +199,15 @@ internal static class SdkProjectDiscovery
                 if (isIndividualTfmRestore)
                 {
                     args.Add($"/p:TargetFramework={tfm}");
+                }
+
+                // if the project lives alongside a solution file, fake the MSBuild `SolutionDir` property so that
+                // project files referencing `$(SolutionDir)` can be evaluated correctly; MSBuild expects this value
+                // to end with a directory separator so that `$(SolutionDir)foo` concatenations form valid paths
+                if (solutionDir is not null)
+                {
+                    var normalizedSolutionDir = $"{solutionDir.TrimEnd('/', Path.DirectorySeparatorChar)}/";
+                    args.Add($"/p:SolutionDir={normalizedSolutionDir}");
                 }
 
                 // if using CPM and a project also sets TreatWarningsAsErrors to true, this can cause discovery to fail; explicitly don't allow that
@@ -446,6 +466,7 @@ internal static class SdkProjectDiscovery
                 packagesPerProject,
                 explicitPackageVersionsPerProject,
                 experimentsManager,
+                solutionDir,
                 logger
             );
         }
@@ -809,6 +830,7 @@ internal static class SdkProjectDiscovery
         Dictionary<string, Dictionary<string, Dictionary<string, string>>> packagesPerProject,
         Dictionary<string, Dictionary<string, Dictionary<string, string>>> explicitPackageVersionsPerProject,
         ExperimentsManager experimentsManager,
+        string? solutionDir,
         ILogger logger
     )
     {
@@ -831,7 +853,7 @@ internal static class SdkProjectDiscovery
 
             var tempProjectPath = await MSBuildHelper.CreateTempProjectAsync(tempDirectory, repoRootPath, projectPath, targetFrameworks, topLevelDependencies, logger);
             var tempProjectDirectory = Path.GetDirectoryName(tempProjectPath)!;
-            var rediscoveredDependencies = await DiscoverAsync(tempProjectDirectory, tempProjectDirectory, tempProjectPath, experimentsManager, logger);
+            var rediscoveredDependencies = await DiscoverAsync(tempProjectDirectory, tempProjectDirectory, tempProjectPath, experimentsManager, solutionDir, logger);
             var tempProjectFileName = Path.GetFileName(tempProjectPath);
             var rediscoveredDependenciesForThisProject = rediscoveredDependencies.FirstOrDefault(r => PathComparer.Instance.Equals(r.FilePath, tempProjectFileName));
             if (rediscoveredDependenciesForThisProject is null)

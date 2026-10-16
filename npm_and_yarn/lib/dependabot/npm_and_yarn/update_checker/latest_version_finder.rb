@@ -141,7 +141,7 @@ module Dependabot
             secure_versions =
               Dependabot::UpdateCheckers::VersionFilters
               .filter_vulnerable_versions(
-                T.unsafe(secure_versions),
+                secure_versions,
                 security_advisories
               )
             secure_versions = filter_ignored_versions(secure_versions)
@@ -169,14 +169,6 @@ module Dependabot
         end
         def available_versions
           possible_releases
-        end
-
-        sig do
-          params(filter_ignored: T::Boolean)
-            .returns(T::Array[T::Array[T.untyped]])
-        end
-        def possible_versions_with_details(filter_ignored: true)
-          possible_releases(filter_ignored: filter_ignored).map { |r| [r.version, r.details] }
         end
 
         sig do
@@ -237,16 +229,9 @@ module Dependabot
         def possible_previous_releases
           (package_details&.releases || [])
             .reject do |r|
-            r.version.prerelease? && !related_to_current_pre?(T.unsafe(r.version))
+            r.version.prerelease? && !related_to_current_pre?(r.version)
           end
             .sort_by(&:version).reverse
-        end
-
-        sig { returns(T::Array[[Dependabot::Version, T::Hash[String, T.nilable(String)]]]) }
-        def possible_previous_versions_with_details
-          possible_previous_releases.map do |r|
-            [r.version, r.details]
-          end
         end
 
         sig { override.returns(T::Boolean) }
@@ -287,8 +272,8 @@ module Dependabot
           return nil unless dist_tags
 
           dist_tag_req = dependency.requirements
-                                   .find { |r| dist_tags.include?(r[:requirement]) }
-                                   &.fetch(:requirement)
+                                   .filter_map(&:requirement_string)
+                                   .find { |req| dist_tags.include?(req) }
 
           # For cooldown filtering, use filtered releases
           releases = available_versions
@@ -337,9 +322,10 @@ module Dependabot
         sig { returns(T::Boolean) }
         def specified_dist_tag_requirement?
           dependency.requirements.any? do |req|
-            next false if req[:requirement].nil?
+            requirement = req.requirement_string
+            next false if requirement.nil?
 
-            req_string = req[:requirement].sub(NpmAndYarn::Requirement::JSR_PREFIX, "")
+            req_string = requirement.sub(NpmAndYarn::Requirement::JSR_PREFIX, "")
             next false unless req_string.match?(/^[A-Za-z]/)
 
             !req_string.match?(/^v\d/i)
@@ -363,9 +349,10 @@ module Dependabot
         sig { params(version: Dependabot::Version).returns(T::Boolean) }
         def current_requirement_greater_than?(version)
           dependency.requirements.any? do |req|
-            next false unless req[:requirement]
+            requirement = req.requirement_string
+            next false unless requirement
 
-            req_version = req[:requirement]
+            req_version = requirement
                           .sub(NpmAndYarn::Requirement::JSR_PREFIX, "")
                           .sub(/^\^|~|>=?/, "")
             next false unless version_class.correct?(req_version)
@@ -383,10 +370,11 @@ module Dependabot
           end
 
           dependency.requirements.any? do |req|
-            next unless req[:requirement]&.match?(/\d-[A-Za-z]/)
+            requirement = req.requirement_string
+            next unless requirement&.match?(/\d-[A-Za-z]/)
 
             NpmAndYarn::Requirement
-              .requirements_array(req.fetch(:requirement))
+              .requirements_array(requirement)
               .any? do |r|
                 r.requirements.any? { |a| a.last.release == version.release }
               end
@@ -413,7 +401,7 @@ module Dependabot
         end
         def filter_out_of_range_versions(releases)
           reqs = dependency.requirements.filter_map do |r|
-            NpmAndYarn::Requirement.requirements_array(r.fetch(:requirement))
+            NpmAndYarn::Requirement.requirements_array(r.requirement_string)
           end
 
           releases.select do |release|
